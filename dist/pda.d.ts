@@ -1,0 +1,18 @@
+import { PublicKey } from "@solana/web3.js";
+export declare const pda: {
+    pool: (a: PublicKey, b: PublicKey, feeBps: number, programId?: PublicKey) => [PublicKey, number];
+    vaultA: (pool: PublicKey, programId?: PublicKey) => [PublicKey, number];
+    vaultB: (pool: PublicKey, programId?: PublicKey) => [PublicKey, number];
+    protocolFeeA: (pool: PublicKey, programId?: PublicKey) => [PublicKey, number];
+    protocolFeeB: (pool: PublicKey, programId?: PublicKey) => [PublicKey, number];
+    creatorFeeA: (pool: PublicKey, programId?: PublicKey) => [PublicKey, number];
+    creatorFeeB: (pool: PublicKey, programId?: PublicKey) => [PublicKey, number];
+    lpMint: (pool: PublicKey, programId?: PublicKey) => [PublicKey, number];
+    lpLock: (pool: PublicKey, programId?: PublicKey) => [PublicKey, number];
+    shielded: (pool: PublicKey, programId?: PublicKey) => [PublicKey, number];
+    tree: (pool: PublicKey, programId?: PublicKey) => [PublicKey, number];
+    custodyA: (pool: PublicKey, programId?: PublicKey) => [PublicKey, number];
+    custodyB: (pool: PublicKey, programId?: PublicKey) => [PublicKey, number];
+    spent: (pool: PublicKey, nullifier: Uint8Array, programId?: PublicKey) => [PublicKey, number];
+    protocolConfig: (programId?: PublicKey) => [PublicKey, number];
+};

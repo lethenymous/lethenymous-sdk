@@ -1,0 +1,36 @@
+import type { JournaledNoteStore, Note, OperationRecord } from "./types.js";
+export declare class EncryptedFileNoteStore implements JournaledNoteStore {
+    private readonly path;
+    private readonly encryptionKey;
+    private readonly owner;
+    private readonly lockPath;
+    private readonly notes;
+    private readonly operations;
+    private sequence;
+    private previousDigest;
+    constructor(path: string, encryptionKey: Uint8Array, owner: Uint8Array);
+    static fromSeed(path: string, seed: Uint8Array, owner: Uint8Array): EncryptedFileNoteStore;
+    private validateNote;
+    private apply;
+    private readJournal;
+    private acquireLock;
+    private append;
+    private mutate;
+    getNotes(ownerCommitment?: Uint8Array<ArrayBufferLike>): Promise<Note[]>;
+    saveNote(input: Note): Promise<void>;
+    reserveNote(commitment: Uint8Array, operationId: Uint8Array, ownerCommitment: Uint8Array): Promise<Note>;
+    reserveNoteAndBegin(commitment: Uint8Array, operationId: Uint8Array, ownerCommitment: Uint8Array, operation: OperationRecord): Promise<Note>;
+    markSubmitted(commitment: Uint8Array, operationId: Uint8Array, signature: string): Promise<void>;
+    markSpent(commitment: Uint8Array, operationId?: Uint8Array): Promise<void>;
+    releaseReservation(commitment: Uint8Array, operationId?: Uint8Array): Promise<void>;
+    beginOperation(operation: OperationRecord): Promise<void>;
+    updateOperation(id: Uint8Array, patch: Partial<Pick<OperationRecord, "metadata" | "outputNotes">>): Promise<void>;
+    markPrepared(id: Uint8Array, signedTransaction: Uint8Array, lastValidBlockHeight: bigint): Promise<void>;
+    markOperationSubmitted(id: Uint8Array, signature: string): Promise<void>;
+    markOperationFinalized(id: Uint8Array): Promise<void>;
+    markOperationFailed(id: Uint8Array, reason: string): Promise<void>;
+    markOperationUnknown(id: Uint8Array, reason: string): Promise<void>;
+    getPendingOperations(): Promise<OperationRecord[]>;
+    exportBackup(): Promise<Uint8Array>;
+    importBackup(backup: Uint8Array): Promise<void>;
+}

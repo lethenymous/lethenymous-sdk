@@ -281,7 +281,7 @@ modified.
 - `release/production-prover-manifest.json` records protocol version, source, target, executable digest, and size.
 - `release/manifest.json` references the remediation report and prover manifest and records the SDK source, lockfile, generated-dist, and npm package hashes.
 - External packed-consumer import succeeded.
-- `scripts/verify_sdk_release.sh` rebuilds/tests from `package-lock.json` and verifies the recorded SDK source commit, lockfile hash, generated-dist archive hash, and npm tarball SHA-256/SHA-512/size; it remains pending the candidate source commit and final hash recording.
+- `scripts/verify_sdk_release.sh` rebuilds/tests from `package-lock.json` and verifies the recorded SDK source commit, lockfile hash, generated-dist archive hash, and npm tarball SHA-256/SHA-512/size; the candidate gate passed.
 
 **Remaining action:** Commit the final provenance metadata after this re-audit and complete funded E2E evidence. Do not tag or publish.
 
@@ -347,7 +347,7 @@ The following were intentionally not changed:
 - Devnet lifecycle and program test crates: compile-checked after IPC migration.
 - Packed npm consumer import: passed outside the monorepo.
 - `npm audit --omit=dev`: 9 accepted residual advisories.
-- SDK release provenance gate: pending candidate source commit and final package hash/size recording.
+- SDK release provenance gate: passed for the candidate source commit and recorded package hashes.
 - Full frozen workspace test suite: passed with the extended timeout; the full-tree capacity test completed successfully.
 - QuickNode incremental profile: cold unshield used 102 HTTP requests and 81 historical transactions; warm unshield used 19 HTTP requests and 2 historical transactions. Cold private swap used 104 HTTP requests and 85 historical transactions; warm private swap used 18 HTTP requests and 2 historical transactions. Warm operations had no 429 responses or duplicate history reads.
 - Real funded QuickNode E2E: preflight passed and a serialized, bounded-rate run observed no 429 responses, but the required six-flow run stopped at Private Send because QuickNode rejected the versioned transaction with JSON-RPC `-32602` (`1233 bytes`, maximum `1232`). No six-flow or restart/recovery success verdict is claimed.

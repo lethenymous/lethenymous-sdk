@@ -71,7 +71,7 @@ status is:
 - Full workspace tests: passed with the extended timeout, including the full-tree capacity test.
 - QuickNode profile after incremental synchronization: cold unshield used 102 HTTP requests and 81 historical transactions; warm unshield used 19 HTTP requests and 2 historical transactions. Cold private swap used 104 HTTP requests and 85 historical transactions; warm private swap used 18 HTTP requests and 2 historical transactions. Warm operations had no 429 responses or duplicate history reads.
 - Real funded finalized QuickNode lifecycle: preflight passed and bounded serialized RPC pacing removed 429 responses, but the required six-flow run stopped at Private Send on JSON-RPC `-32602` because the versioned transaction was `1233` bytes against a `1232`-byte maximum. No six-flow or restart/recovery success verdict is claimed.
-- `scripts/verify_sdk_release.sh`: pending the candidate source commit and final provenance hashes.
+- `scripts/verify_sdk_release.sh`: passed for the candidate source commit and recorded provenance hashes.
 
 ## Release Decision
 

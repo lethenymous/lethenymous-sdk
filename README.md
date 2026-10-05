@@ -148,6 +148,16 @@ with a non-null `value.err` is a finalized failure. Timeouts and incomplete
 status are represented as an unknown/ambiguous outcome and must be reconciled;
 a signature alone is not success.
 
+## Repository and license
+
+The public source repository is
+[`lethenymous/lethenymous-sdk`](https://github.com/lethenymous/lethenymous-sdk).
+`@lethenymous/sdk` is distributed under the MIT License; see `LICENSE`. The
+underlying zkCPMM repository is a separate project with its own license.
+
+The repository's extracted development-history provenance is documented in
+`MIGRATION.md`.
+
 ## Security model
 
 Spend secrets, view keys, note randomness, commitments, and proving witnesses

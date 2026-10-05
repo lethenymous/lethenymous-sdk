@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -301,8 +302,12 @@ test("configured program IDs bind PDAs and instruction program IDs", () => {
   assert.notEqual(pda.pool(mintA, mintB, 100)[0].toBase58(), pda.pool(mintA, mintB, 100, alternate)[0].toBase58());
 });
 
-test("production prover rejects legacy file IPC and malformed stdin without secret-bearing errors", () => {
+test("production prover rejects legacy file IPC and malformed stdin without secret-bearing errors", t => {
   const binary = resolve(process.cwd(), "../audit/tooling/production-prover/target/release/production-prover");
+  if (!existsSync(binary)) {
+    t.skip("the standalone SDK does not bundle the external production prover");
+    return;
+  }
   const pk = resolve(process.cwd(), "../artifacts/production-groth16-v1/unshield_pk.production.bin");
   const legacy = spawnSync(binary, ["unshield", "/tmp/request", "/tmp/output"], { encoding: "utf8" });
   assert.notEqual(legacy.status, 0);

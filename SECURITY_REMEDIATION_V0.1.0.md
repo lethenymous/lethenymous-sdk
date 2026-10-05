@@ -26,7 +26,7 @@ modified.
 - F-14: ATA derivation and existing-account validation are explicit and off-curve-aware.
 - F-15: remove-liquidity prepares destination ATAs idempotently.
 - F-16: LUT existence, activation, authority, expected contents, and slot usability are validated when configured.
-- F-17: release provenance metadata and an authenticated prover manifest were added; candidate commit remains required before release.
+- F-17: release provenance metadata and authenticated prover/checkpoint manifests were added; the SDK source will be bound to the candidate source commit in the release manifest.
 - F-18: dependency audit was rerun; no compatible safe upgrade exists without an incompatible Solana-stack change.
 - F-19: package documentation was corrected and explicitly identifies source-derived codecs instead of a generated IDL.
 - Additional pre-release review: the frozen TreeState account length, ambiguous submission path, journal crash ordering, event-time root replay, and spent-note recovery were corrected before re-audit closure.
@@ -138,6 +138,8 @@ modified.
 - Historical private-swap roots are reconstructed by event-time sequence and checked against the root window that existed when each event executed, rather than only the current ring.
 - Private-swap leaf sequence/index replay uses actual leaf indexes instead of `root_sequence + 1/+2`.
 - `Unshielded` events are parsed with exact lengths and their nullifiers are exposed for recovery.
+- Persistent encrypted checkpoints are keyed by full deployment identity, replay-validated, cursor-checked, atomically replaced, and reused only for finalized suffixes.
+- Swap nullifiers are retained across restart, and wallet recovery independently verifies finalized spent-nullifier PDAs.
 - Final replayed root, sequence, next index, and generation are compared with finalized tree state.
 
 **Tests:** the provider implementation includes strict event parsing and independent replay/root checks. Full malicious-RPC live tests remain part of the unavailable funded Devnet E2E fixture.
@@ -262,6 +264,7 @@ modified.
 - LUTs are fetched at finalized commitment.
 - Existence, last-extension slot, deactivation status, optional authority, and optional exact expected address set are validated.
 - Same-slot extension boundaries use `lastExtendedSlotStartIndex`; newly appended addresses cannot be treated as active at the extension slot.
+- Lookup-table responses are bound to the requested table key, frozen authorities normalize to the documented `null` form, and same-slot cache misses are coalesced.
 - Versioned private transactions require a configured LUT and versioned signer.
 - README and E2E configuration document deployment-specific LUT requirements.
 
@@ -269,18 +272,18 @@ modified.
 
 ### F-17 - Release provenance
 
-**Status:** `MITIGATED`; candidate commit is required before release.
+**Status:** `MITIGATED`; final provenance metadata commit and funded E2E evidence remain required before release.
 
 **Changes:**
 
 - SDK source, tests, generated `dist`, lockfile, README, and reports are now part of the candidate working tree.
 - `lethenymous-sdk/.gitignore` excludes `node_modules`, secrets, environment files, and tarballs.
 - `release/production-prover-manifest.json` records protocol version, source, target, executable digest, and size.
-- `release/manifest.json` references the remediation report and prover manifest.
+- `release/manifest.json` references the remediation report and prover manifest and records the SDK source, lockfile, generated-dist, and npm package hashes.
 - External packed-consumer import succeeded.
-- `scripts/verify_sdk_release.sh` rebuilds/tests from `package-lock.json` and verifies the recorded SDK source commit, lockfile hash, generated-dist archive hash, and npm tarball SHA-256/SHA-512/size.
+- `scripts/verify_sdk_release.sh` rebuilds/tests from `package-lock.json` and verifies the recorded SDK source commit, lockfile hash, generated-dist archive hash, and npm tarball SHA-256/SHA-512/size; it remains pending the candidate source commit and final hash recording.
 
-**Remaining action:** Create and record the clean candidate commit after this re-audit. Do not tag or publish.
+**Remaining action:** Commit the final provenance metadata after this re-audit and complete funded E2E evidence. Do not tag or publish.
 
 ### F-18 - Dependency advisories
 
@@ -317,7 +320,8 @@ changes to the preserved initial finding text:
 - `src/client.ts` preserves ambiguity when signed submission acknowledgement or reconciliation fails and only treats expiry as failure when finalized RPC checks show no signature/transaction.
 - `src/store.ts` initializes journals through a synced temporary file and rename, repairs only an incomplete final frame, serializes a PID lock, recovers stale locks, serializes reads under the lock, and reloads backups before releasing the lock.
 - `src/wallet.ts` uses atomic reserve-plus-operation intent, derives prepared signatures during restart reconciliation, makes final state transitions idempotent, and refuses an omitted `NoteStore` at runtime.
-- `src/witness.ts` replays event-time root history and authenticates finalized unshield nullifiers for recovery.
+- `src/witness.ts` replays event-time root history, authenticates finalized transaction/signature ordering, persists swap and unshield nullifiers, and fails closed on incomplete pagination.
+- `src/wallet.ts` verifies finalized spent-nullifier PDA ownership, discriminator, pool, nullifier, and version before recovery marks notes spent.
 
 These corrections are covered by the TreeState, LUT, journal restart, derived
 signature, and reconciliation tests in `tests/remediation.test.mjs`.
@@ -338,19 +342,21 @@ The following were intentionally not changed:
 
 - SDK typecheck: passed.
 - SDK build: passed.
-- SDK tests: 23 passed.
+- SDK tests: 31 passed, including cold/warm/restart incremental Merkle checkpoint, pagination, cache-integrity, gap, provenance, generation, bounded-retry, and spent-nullifier account verification tests.
 - Production prover tests: passed with zero test failures.
 - Devnet lifecycle and program test crates: compile-checked after IPC migration.
 - Packed npm consumer import: passed outside the monorepo.
 - `npm audit --omit=dev`: 9 accepted residual advisories.
-- Full frozen workspace test suite: the existing full-tree capacity test exceeded five minutes in this environment; no assertion failure was observed before timeout. Targeted program checks and the remaining workspace unit tests passed.
-- Real funded Devnet E2E: not run because isolated fixture variables were unavailable (`E2E_POOL`, `E2E_BOB_KEYPAIR`, `E2E_SEED_HEX`, and persistent store path).
+- SDK release provenance gate: pending candidate source commit and final package hash/size recording.
+- Full frozen workspace test suite: passed with the extended timeout; the full-tree capacity test completed successfully.
+- QuickNode incremental profile: cold unshield used 102 HTTP requests and 81 historical transactions; warm unshield used 19 HTTP requests and 2 historical transactions. Cold private swap used 104 HTTP requests and 85 historical transactions; warm private swap used 18 HTTP requests and 2 historical transactions. Warm operations had no 429 responses or duplicate history reads.
+- Real funded QuickNode E2E: preflight passed and a serialized, bounded-rate run observed no 429 responses, but the required six-flow run stopped at Private Send because QuickNode rejected the versioned transaction with JSON-RPC `-32602` (`1233 bytes`, maximum `1232`). No six-flow or restart/recovery success verdict is claimed.
 
 ## Release Decision
 
 `BLOCKED`
 
 The practical HIGH/MEDIUM implementation work is complete, but `READY FOR
-RELEASE` is not claimed because the clean candidate commit and required real
-finalized funded E2E evidence are still pending. No npm publication or tag was
-created.
+RELEASE` is not claimed because the final provenance metadata commit and
+required real finalized funded E2E evidence are still pending. No npm
+publication or tag was created.

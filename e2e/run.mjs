@@ -6,7 +6,7 @@ import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import { getAccount, getAssociatedTokenAddressSync } from "@solana/spl-token";
 import {
   Lethenymous, ProductionProver,
-  RpcMerkleWitnessProvider, PROGRAM_ID, pda, nullifier,
+  RpcMerkleWitnessProvider, EncryptedFileNoteStore, PROGRAM_ID, keyHierarchy, ownerCommitment, pda, nullifier,
 } from "../dist/index.js";
 
 const env = process.env;
@@ -23,17 +23,20 @@ if (!env.E2E_NOTE_STORE) throw new Error("E2E_NOTE_STORE must identify an encryp
 const keypair = bytes => Keypair.fromSecretKey(Uint8Array.from(JSON.parse(bytes)));
 const payer = keypair(await readFile(payerPath, "utf8"));
 const bob = keypair(await readFile(bobPath, "utf8"));
+const seed = Uint8Array.from(Buffer.from(seedHex, "hex"));
+const noteStorePath = expand(env.E2E_NOTE_STORE);
+const noteStore = EncryptedFileNoteStore.fromSeed(noteStorePath, seed, ownerCommitment(keyHierarchy(seed).spendSecret));
 const connection = new Connection(rpcUrl, "confirmed");
 const walletAdapter = { publicKey: payer.publicKey, signTransaction: async tx => { tx.partialSign(payer); return tx; }, signVersionedTransaction: async tx => { tx.sign([payer]); return tx; } };
 let sdk;
-const witnessProvider = new RpcMerkleWitnessProvider(connection, programId, pool => sdk.getTree(pool));
+const witnessProvider = new RpcMerkleWitnessProvider(connection, programId, pool => sdk.getTree(pool), noteStore);
 sdk = new Lethenymous({ connection, wallet: walletAdapter, programId, witnessProvider, lookupTables: env.E2E_LOOKUP_TABLE ? [new PublicKey(env.E2E_LOOKUP_TABLE)] : [] });
 const prover = new ProductionProver({
   executablePath: expand(env.E2E_PROVER_BIN ?? "audit/tooling/production-prover/target/release/production-prover"),
   privateSwapPkPath: expand(env.E2E_PRIVATE_SWAP_PK ?? "artifacts/production-groth16-v1/private_swap_pk.production.bin"),
   unshieldPkPath: expand(env.E2E_UNSHIELD_PK ?? "artifacts/production-groth16-v1/unshield_pk.production.bin"),
 });
-const shielded = sdk.shieldedWallet(Uint8Array.from(Buffer.from(seedHex, "hex")), prover, { storagePath: expand(env.E2E_NOTE_STORE) });
+const shielded = sdk.shieldedWallet(seed, prover, { noteStore });
 const report = [];
 const same = (a, b) => Buffer.from(a).equals(Buffer.from(b));
 async function token(address) { return (await getAccount(connection, address, "finalized")).amount; }

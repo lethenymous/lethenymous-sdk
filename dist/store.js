@@ -9,6 +9,10 @@ const FORMAT_VERSION = 1;
 const AAD_PREFIX = Buffer.from("zkcpmm-v2/note-store/v1");
 const ZERO_DIGEST = new Uint8Array(32);
 const MAX_FRAME = 2 * 1024 * 1024;
+const CHECKPOINT_MAGIC = Buffer.from("LMCP");
+const CHECKPOINT_VERSION = 1;
+const CHECKPOINT_AAD_PREFIX = Buffer.from("zkcpmm-v2/merkle-checkpoint/v1");
+const MAX_CHECKPOINT = 64 * 1024 * 1024;
 const LOCK_STALE_MS = 30_000;
 const hex = (value) => Buffer.from(value).toString("hex");
 const bytes = (value) => Uint8Array.from(Buffer.from(value, "hex"));
@@ -584,6 +588,68 @@ export class EncryptedFileNoteStore {
         }
         finally {
             await rm(temporary, { force: true });
+        }
+    }
+    checkpointPath(identity) {
+        const digest = createHash("sha256").update(Buffer.from("zkcpmm-merkle-checkpoint-path/v1\0")).update(identity).digest("hex");
+        return `${this.path}.merkle-${digest}`;
+    }
+    async loadMerkleCheckpoint(identity) {
+        const unlock = await this.acquireLock();
+        try {
+            let data;
+            try {
+                data = await readFile(this.checkpointPath(identity));
+            }
+            catch (error) {
+                if (error.code === "ENOENT")
+                    return undefined;
+                throw error;
+            }
+            if (data.length < CHECKPOINT_MAGIC.length + 1 + 24 + 16 || !data.subarray(0, CHECKPOINT_MAGIC.length).equals(CHECKPOINT_MAGIC) || data[CHECKPOINT_MAGIC.length] !== CHECKPOINT_VERSION) {
+                throw new Error("Invalid Merkle checkpoint header");
+            }
+            const nonceOffset = CHECKPOINT_MAGIC.length + 1;
+            const nonce = data.subarray(nonceOffset, nonceOffset + 24);
+            const ciphertext = data.subarray(nonceOffset + 24);
+            if (ciphertext.length > MAX_CHECKPOINT + 16)
+                throw new Error("Merkle checkpoint is too large");
+            const aad = Buffer.concat([CHECKPOINT_AAD_PREFIX, Buffer.from(identity)]);
+            try {
+                return Uint8Array.from(xchacha20poly1305(this.encryptionKey, nonce, aad).decrypt(ciphertext));
+            }
+            catch {
+                throw new Error("Invalid Merkle checkpoint integrity");
+            }
+        }
+        finally {
+            await unlock();
+        }
+    }
+    async saveMerkleCheckpoint(identity, checkpoint) {
+        if (checkpoint.length > MAX_CHECKPOINT)
+            throw new Error("Merkle checkpoint is too large");
+        const unlock = await this.acquireLock();
+        const path = this.checkpointPath(identity);
+        const temporary = `${path}.tmp-${process.pid}-${Date.now()}`;
+        try {
+            const nonce = cryptoRandom(24);
+            const aad = Buffer.concat([CHECKPOINT_AAD_PREFIX, Buffer.from(identity)]);
+            const ciphertext = xchacha20poly1305(this.encryptionKey, nonce, aad).encrypt(checkpoint);
+            const encoded = Buffer.concat([CHECKPOINT_MAGIC, Buffer.from([CHECKPOINT_VERSION]), Buffer.from(nonce), Buffer.from(ciphertext)]);
+            const handle = await open(temporary, "wx", 0o600);
+            try {
+                await handle.write(encoded);
+                await handle.sync();
+            }
+            finally {
+                await handle.close();
+            }
+            await rename(temporary, path);
+        }
+        finally {
+            await rm(temporary, { force: true });
+            await unlock();
         }
     }
 }

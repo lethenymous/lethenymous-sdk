@@ -1,9 +1,11 @@
 import { ComputeBudgetProgram, PublicKey } from "@solana/web3.js";
 import { createAssociatedTokenAccountIdempotentInstruction, getAssociatedTokenAddressSync, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { cryptoRandom, decryptNotePayload, encryptNote, encodeNote, keyHierarchy, noteCommitment, nullifier, ownerCommitment } from "./crypto.js";
+import { accountDiscriminator } from "./encoding.js";
 import { privateSwap as privateSwapIx, shield as shieldIx, unshield as unshieldIx } from "./instructions.js";
 import { encodePrivateSwapPublicInputs, encodeUnshieldPublicInputs } from "./prover.js";
 import { swapOutputPreservingLpClaims } from "./math.js";
+import { pda } from "./pda.js";
 import type { JournaledNoteStore, MerkleWitnessProvider, Note, NoteStore, OperationRecord, Prover, ShieldParams } from "./types.js";
 import { transactionSignatureFromBytes, type Lethenymous } from "./client.js";
 
@@ -322,14 +324,36 @@ export class ShieldedWallet {
     const stateAccount = await this.sdk.getShieldedState(pool);
     const spentNullifiers = new Set((await provider.getSpentNullifiers(pool)).map(value => key(value)));
     const existing = new Map((await this.getNotes()).filter(note => note.pool.equals(pool)).map(note => [key(note.commitment), note]));
-    const recovered: Note[] = [];
-    for (const event of await provider.getShieldEvents(pool)) {
+    const events = await provider.getShieldEvents(pool);
+    const decoded: Array<{ event: (typeof events)[number]; mint: PublicKey; randomness: Uint8Array; ownerCommitment: Uint8Array; amount: bigint; nullifier: Uint8Array }> = [];
+    for (const event of events) {
       const mint = event.asset === 0 ? stateAccount.tokenAMint : event.asset === 1 ? stateAccount.tokenBMint : undefined;
       if (!mint) throw new Error("Invalid shield asset in recovery history");
-      const decoded = decryptNotePayload(event.encryptedNote, this.viewKey, pool, mint, event.commitment);
-      if (!same(decoded.ownerCommitment, this.ownerCommitment)) continue;
-      const consumed = spentNullifiers.has(key(nullifier(pool, mint, this.spendSecret, decoded.randomness)));
-      const note: Note = { pool, asset: mint, amount: decoded.amount, ownerCommitment: decoded.ownerCommitment, randomness: decoded.randomness, commitment: event.commitment, encryptedPayload: event.encryptedNote, leafIndex: event.index, state: consumed ? "spent" : "available" };
+      const note = decryptNotePayload(event.encryptedNote, this.viewKey, pool, mint, event.commitment);
+      if (!same(note.ownerCommitment, this.ownerCommitment)) continue;
+      decoded.push({ event, mint, randomness: note.randomness, ownerCommitment: note.ownerCommitment, amount: note.amount, nullifier: nullifier(pool, mint, this.spendSecret, note.randomness) });
+    }
+    const getMultipleAccountsInfo = this.sdk.connection.getMultipleAccountsInfo?.bind(this.sdk.connection);
+    if (decoded.length && !getMultipleAccountsInfo) throw new Error("RPC does not support finalized spent-nullifier verification");
+    const spentDiscriminator = accountDiscriminator("SpentNullifier");
+    for (let offset = 0; offset < decoded.length; offset += 100) {
+      const batch = decoded.slice(offset, offset + 100);
+      const addresses = batch.map(value => pda.spent(pool, value.nullifier, this.sdk.programId)[0]);
+      const accounts = await getMultipleAccountsInfo!(addresses, "finalized");
+      if (accounts.length !== batch.length) throw new Error("RPC returned an incomplete spent-nullifier response");
+      for (let index = 0; index < accounts.length; index++) {
+        const account = accounts[index];
+        if (!account) continue;
+        const data = account.data;
+        if (!account.owner.equals(this.sdk.programId) || data.length !== 73 || !data.subarray(0, 8).equals(spentDiscriminator) || !data.subarray(8, 40).equals(pool.toBuffer()) || !data.subarray(40, 72).equals(Buffer.from(batch[index].nullifier)) || data[72] !== 1) throw new Error("Invalid spent-nullifier account");
+        spentNullifiers.add(key(batch[index].nullifier));
+      }
+    }
+    const recovered: Note[] = [];
+    for (const candidate of decoded) {
+      const { event, mint } = candidate;
+      const consumed = spentNullifiers.has(key(candidate.nullifier));
+      const note: Note = { pool, asset: mint, amount: candidate.amount, ownerCommitment: candidate.ownerCommitment, randomness: candidate.randomness, commitment: event.commitment, encryptedPayload: event.encryptedNote, leafIndex: event.index, state: consumed ? "spent" : "available" };
       const current = existing.get(key(note.commitment));
       if (!current) await this.store.saveNote(note);
       else if (consumed && state(current) !== "spent") {

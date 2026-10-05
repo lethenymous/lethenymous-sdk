@@ -36,6 +36,8 @@ export declare class Lethenymous {
     readonly programId: PublicKey;
     readonly witnessProvider?: MerkleWitnessProvider;
     private readonly lookupTables;
+    private readonly lookupTableCache;
+    private readonly lookupTableLoads;
     constructor(config: ClientConfig);
     private account;
     getPool(address: PublicKey): Promise<PoolState>;

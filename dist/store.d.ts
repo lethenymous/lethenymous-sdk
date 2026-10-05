@@ -1,5 +1,5 @@
-import type { JournaledNoteStore, Note, OperationRecord } from "./types.js";
-export declare class EncryptedFileNoteStore implements JournaledNoteStore {
+import type { JournaledNoteStore, MerkleCheckpointStore, Note, OperationRecord } from "./types.js";
+export declare class EncryptedFileNoteStore implements JournaledNoteStore, MerkleCheckpointStore {
     private readonly path;
     private readonly encryptionKey;
     private readonly owner;
@@ -33,4 +33,7 @@ export declare class EncryptedFileNoteStore implements JournaledNoteStore {
     getPendingOperations(): Promise<OperationRecord[]>;
     exportBackup(): Promise<Uint8Array>;
     importBackup(backup: Uint8Array): Promise<void>;
+    private checkpointPath;
+    loadMerkleCheckpoint(identity: string): Promise<Uint8Array | undefined>;
+    saveMerkleCheckpoint(identity: string, checkpoint: Uint8Array): Promise<void>;
 }

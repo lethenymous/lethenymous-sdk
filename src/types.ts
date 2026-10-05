@@ -98,6 +98,12 @@ export interface MerkleWitnessProvider {
   getWitness(pool: PublicKey, commitment: Uint8Array): Promise<MerkleWitness>;
 }
 
+/** Implementations must authenticate checkpoint bytes and make replacement writes crash-safe. */
+export interface MerkleCheckpointStore {
+  loadMerkleCheckpoint(identity: string): Promise<Uint8Array | undefined>;
+  saveMerkleCheckpoint(identity: string, checkpoint: Uint8Array): Promise<void>;
+}
+
 export type NoteState = "available" | "reserved" | "submitted" | "spent";
 
 export interface Note {

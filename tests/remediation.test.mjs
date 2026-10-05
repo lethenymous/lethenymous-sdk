@@ -156,10 +156,11 @@ test("TreeState decoder uses the frozen account layout", () => {
 test("configured LUT identity and finalized activation are validated before private proof setup", async () => {
   const tableAddress = new PublicKey(new Uint8Array(32).fill(11));
   const expectedAddress = new PublicKey(new Uint8Array(32).fill(12));
-  const fakeTable = { state: { lastExtendedSlot: 1, deactivationSlot: 18446744073709551615n, authority: null, addresses: [expectedAddress] } };
+  const fakeTable = { key: tableAddress, state: { lastExtendedSlot: 1, deactivationSlot: 18446744073709551615n, authority: null, addresses: [expectedAddress] } };
   const connection = fakeConnection({ value: { err: null } }, { });
+  let tableReads = 0;
   connection.getSlot = async () => 10;
-  connection.getAddressLookupTable = async () => ({ value: fakeTable });
+  connection.getAddressLookupTable = async () => { tableReads++; return { value: fakeTable }; };
   const client = new Lethenymous({
     connection,
     wallet: { publicKey: payer.publicKey, signTransaction: async tx => tx, signVersionedTransaction: async tx => tx },
@@ -167,11 +168,19 @@ test("configured LUT identity and finalized activation are validated before priv
   });
   const ix = new TransactionInstruction({ programId: SystemProgram.programId, keys: [{ pubkey: expectedAddress, isSigner: false, isWritable: false }] });
   await client.validatePrivateTransactionReady([ix]);
+  await client.validatePrivateTransactionReady([ix]);
+  assert.equal(tableReads, 1);
   const invalid = new Lethenymous({ connection, wallet: client.wallet, lookupTables: [{ address: tableAddress, expectedAddresses: [payer.publicKey] }] });
   await assert.rejects(() => invalid.validatePrivateTransactionReady([ix]), /contents differ|missing/);
-  const extendingConnection = { ...connection, getAddressLookupTable: async () => ({ value: { state: { ...fakeTable.state, lastExtendedSlot: 10, lastExtendedSlotStartIndex: 0 } } }) };
+  const extendingConnection = { ...connection, getAddressLookupTable: async () => ({ value: { key: tableAddress, state: { ...fakeTable.state, lastExtendedSlot: 10, lastExtendedSlotStartIndex: 0 } } }) };
   const extending = new Lethenymous({ connection: extendingConnection, wallet: client.wallet, lookupTables: [{ address: tableAddress }] });
   await assert.rejects(() => extending.validatePrivateTransactionReady([ix]), /not active/);
+  const frozenConnection = { ...connection, getAddressLookupTable: async () => ({ value: { key: tableAddress, state: { ...fakeTable.state, authority: undefined } } }) };
+  const frozen = new Lethenymous({ connection: frozenConnection, wallet: client.wallet, lookupTables: [{ address: tableAddress, expectedAuthority: null }] });
+  await frozen.validatePrivateTransactionReady([ix]);
+  const wrongKeyConnection = { ...connection, getAddressLookupTable: async () => ({ value: { key: payer.publicKey, state: fakeTable.state } }) };
+  const wrongKey = new Lethenymous({ connection: wrongKeyConnection, wallet: client.wallet, lookupTables: [{ address: tableAddress }] });
+  await assert.rejects(() => wrongKey.validatePrivateTransactionReady([ix]), /wrong account/);
 });
 
 test("frozen outer-version-1 shield payload decrypts and authenticates", () => {

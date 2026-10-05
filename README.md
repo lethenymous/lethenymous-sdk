@@ -84,6 +84,25 @@ with atomic reservation and operation transitions. The file contains note
 randomness and pending operation preimages, so it must be protected like the
 seed. Losing both the seed and the journal/backup loses recovery material.
 
+For persistent finalized Merkle reconstruction, pass the same store to
+`RpcMerkleWitnessProvider` as its checkpoint store. Checkpoints are encrypted
+and authenticated sidecars keyed by genesis identity, program, pool, tree, and
+generation. The provider still refreshes finalized tree state and verifies the
+reconstructed root before returning a witness. A custom checkpoint store must
+provide equivalent authenticated, crash-safe replacement semantics.
+
+```ts
+let sdk: Lethenymous;
+const witnessProvider = new RpcMerkleWitnessProvider(
+  connection,
+  programId,
+  pool => sdk.getTree(pool),
+  store,
+);
+sdk = new Lethenymous({ connection, wallet, programId, witnessProvider });
+const shielded = sdk.shieldedWallet(seed, prover, { noteStore: store });
+```
+
 The default `Lethenymous.shieldedWallet` path refuses to create a volatile
 store. `InMemoryNoteStore` remains available only when explicitly supplied for
 tests, demos, or ephemeral development.
@@ -93,6 +112,8 @@ new private operations. The method checks finalized transaction status and the
 authenticated zkCPMM event before applying pending local state. A wallet can
 also call `recoverShieldedNotes(pool)` with `RpcMerkleWitnessProvider` to scan
 finalized shield events and decrypt the frozen outer-version-1 note envelope.
+Recovery also verifies finalized spent-nullifier PDAs before marking a note
+spent, rather than relying only on event history.
 
 Use `exportBackup()` and `importBackup()` for encrypted journal backup and
 restore. Backups contain note randomness and pending operation material and

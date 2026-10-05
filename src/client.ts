@@ -98,6 +98,8 @@ export class Lethenymous {
   readonly programId: PublicKey;
   readonly witnessProvider?: MerkleWitnessProvider;
   private readonly lookupTables: LookupTableConfig[];
+  private readonly lookupTableCache = new Map<string, { slot: number; table: AddressLookupTableAccount }>();
+  private readonly lookupTableLoads = new Map<string, Promise<{ slot: number; table: AddressLookupTableAccount }>>();
 
   constructor(config: ClientConfig) {
     this.connection = config.connection;
@@ -153,14 +155,37 @@ export class Lethenymous {
     const slot = await this.connection.getSlot(FINALIZED);
     const tables: AddressLookupTableAccount[] = [];
     for (const config of this.lookupTables) {
-      const value = (await this.connection.getAddressLookupTable(config.address, { commitment: FINALIZED })).value;
-      if (!value) throw new Error(`Configured address lookup table is unavailable: ${config.address.toBase58()}`);
+      const key = config.address.toBase58();
+      let entry = this.lookupTableCache.get(key)?.slot === slot ? this.lookupTableCache.get(key) : undefined;
+      if (!entry) {
+        let load = this.lookupTableLoads.get(key);
+        if (!load) {
+          load = (async () => {
+            const response = await this.connection.getAddressLookupTable(config.address, { commitment: FINALIZED });
+            const value = response.value;
+            if (!value) throw new Error(`Configured address lookup table is unavailable: ${config.address.toBase58()}`);
+            if (!value.key.equals(config.address)) throw new Error(`Configured address lookup table returned the wrong account: ${config.address.toBase58()}`);
+            const responseSlot = response.context?.slot ?? slot;
+            if (!Number.isSafeInteger(responseSlot) || responseSlot < 0) throw new Error("Configured address lookup table returned an invalid context slot");
+            return { slot: responseSlot, table: value };
+          })();
+          this.lookupTableLoads.set(key, load);
+        }
+        try {
+          entry = await load;
+          this.lookupTableCache.set(key, entry);
+        } finally {
+          if (this.lookupTableLoads.get(key) === load) this.lookupTableLoads.delete(key);
+        }
+      }
+      const value = entry.table;
+      const validationSlot = entry.slot;
       const state = value.state;
       const lastExtendedSlotStartIndex = state.lastExtendedSlotStartIndex ?? state.addresses.length;
-      if (BigInt(state.lastExtendedSlot) > BigInt(slot) || (BigInt(state.lastExtendedSlot) === BigInt(slot) && lastExtendedSlotStartIndex < state.addresses.length)) throw new Error("Configured address lookup table is not active at finalized slot");
-      if (state.deactivationSlot !== MAX_U64 && state.deactivationSlot <= BigInt(slot)) throw new Error("Configured address lookup table is deactivated");
+      if (BigInt(state.lastExtendedSlot) > BigInt(validationSlot) || (BigInt(state.lastExtendedSlot) === BigInt(validationSlot) && lastExtendedSlotStartIndex < state.addresses.length)) throw new Error("Configured address lookup table is not active at finalized slot");
+      if (state.deactivationSlot !== MAX_U64 && state.deactivationSlot <= BigInt(validationSlot)) throw new Error("Configured address lookup table is deactivated");
       if (config.expectedAuthority !== undefined) {
-        const actual = state.authority;
+        const actual = state.authority ?? null;
         if ((actual === null) !== (config.expectedAuthority === null) || (actual && !actual.equals(config.expectedAuthority!))) throw new Error("Configured address lookup table authority mismatch");
       }
       if (config.expectedAddresses) {

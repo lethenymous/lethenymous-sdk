@@ -8,6 +8,7 @@ import {
   Lethenymous, ProductionProver,
   RpcMerkleWitnessProvider, EncryptedFileNoteStore, PROGRAM_ID, keyHierarchy, ownerCommitment, pda, nullifier,
 } from "../dist/index.js";
+import { lookupTableConfig } from "./fixture.mjs";
 
 const env = process.env;
 const rpcUrl = env.E2E_RPC_URL ?? "https://api.devnet.solana.com";
@@ -30,7 +31,7 @@ const connection = new Connection(rpcUrl, "confirmed");
 const walletAdapter = { publicKey: payer.publicKey, signTransaction: async tx => { tx.partialSign(payer); return tx; }, signVersionedTransaction: async tx => { tx.sign([payer]); return tx; } };
 let sdk;
 const witnessProvider = new RpcMerkleWitnessProvider(connection, programId, pool => sdk.getTree(pool), noteStore);
-sdk = new Lethenymous({ connection, wallet: walletAdapter, programId, witnessProvider, lookupTables: env.E2E_LOOKUP_TABLE ? [new PublicKey(env.E2E_LOOKUP_TABLE)] : [] });
+sdk = new Lethenymous({ connection, wallet: walletAdapter, programId, witnessProvider, lookupTables: env.E2E_LOOKUP_TABLE ? [lookupTableConfig(new PublicKey(env.E2E_LOOKUP_TABLE), payer.publicKey)] : [] });
 const prover = new ProductionProver({
   executablePath: expand(env.E2E_PROVER_BIN ?? "audit/tooling/production-prover/target/release/production-prover"),
   privateSwapPkPath: expand(env.E2E_PRIVATE_SWAP_PK ?? "artifacts/production-groth16-v1/private_swap_pk.production.bin"),

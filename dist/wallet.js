@@ -386,7 +386,14 @@ export class ShieldedWallet {
             const mint = event.asset === 0 ? stateAccount.tokenAMint : event.asset === 1 ? stateAccount.tokenBMint : undefined;
             if (!mint)
                 throw new Error("Invalid shield asset in recovery history");
-            const note = decryptNotePayload(event.encryptedNote, this.viewKey, pool, mint, event.commitment);
+            let note;
+            try {
+                note = decryptNotePayload(event.encryptedNote, this.viewKey, pool, mint, event.commitment);
+            }
+            catch {
+                // Shared pools contain envelopes for other wallets; their view-key authentication must fail closed and be skipped.
+                continue;
+            }
             if (!same(note.ownerCommitment, this.ownerCommitment))
                 continue;
             decoded.push({ event, mint, randomness: note.randomness, ownerCommitment: note.ownerCommitment, amount: note.amount, nullifier: nullifier(pool, mint, this.spendSecret, note.randomness) });

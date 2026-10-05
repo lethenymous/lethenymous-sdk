@@ -4,7 +4,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { Keypair, PublicKey, SystemProgram, TransactionInstruction } from "@solana/web3.js";
+import { AddressLookupTableAccount, ComputeBudgetProgram, Keypair, PublicKey, SystemProgram, TransactionInstruction, TransactionMessage, VersionedTransaction } from "@solana/web3.js";
 import {
   EncryptedFileNoteStore,
   Lethenymous,
@@ -22,10 +22,14 @@ import {
   noteCommitment,
   ownerCommitment,
   pda,
+  PROGRAM_ID,
   swapOutput,
   swapOutputPreservingLpClaims,
+  SYSTEM_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
   u16,
   u64,
+  unshield,
 } from "../dist/index.js";
 
 const payer = Keypair.generate();
@@ -181,6 +185,81 @@ test("configured LUT identity and finalized activation are validated before priv
   const wrongKeyConnection = { ...connection, getAddressLookupTable: async () => ({ value: { key: payer.publicKey, state: fakeTable.state } }) };
   const wrongKey = new Lethenymous({ connection: wrongKeyConnection, wallet: client.wallet, lookupTables: [{ address: tableAddress }] });
   await assert.rejects(() => wrongKey.validatePrivateTransactionReady([ix]), /wrong account/);
+});
+
+test("frozen unshield fits the packet limit with the deployed fixture LUT", () => {
+  const payer = Keypair.generate();
+  const bob = Keypair.generate();
+  const key = seed => new PublicKey(Uint8Array.from({ length: 32 }, (_, index) => (seed + index) & 0xff));
+  const poolAddress = key(1);
+  const mintA = key(40);
+  const mintB = key(80);
+  const shielded = pda.shielded(poolAddress, PROGRAM_ID)[0];
+  const tree = pda.tree(poolAddress, PROGRAM_ID)[0];
+  const custodyA = pda.custodyA(poolAddress, PROGRAM_ID)[0];
+  const custodyB = pda.custodyB(poolAddress, PROGRAM_ID)[0];
+  const pool = { address: poolAddress, tokenAMint: mintA, tokenBMint: mintB };
+  const state = { tree, custodyA, custodyB };
+  const tableKey = key(180);
+  const filler = count => Array.from({ length: count }, (_, index) => key(200 + index));
+  const table = addresses => new AddressLookupTableAccount({
+    key: tableKey,
+    state: {
+      deactivationSlot: 18446744073709551615n,
+      lastExtendedSlot: 0,
+      lastExtendedSlotStartIndex: 0,
+      authority: null,
+      addresses,
+    },
+  });
+  const fixtureTable = table([
+    poolAddress, shielded, tree, custodyA, custodyB, mintA, mintB,
+    ...filler(6), TOKEN_PROGRAM_ID, SYSTEM_PROGRAM_ID,
+  ]);
+  const compactTable = table([poolAddress, mintA, mintB, ...filler(8), TOKEN_PROGRAM_ID]);
+  const compile = (recipient, lookupTable) => {
+    const recipientA = key(20);
+    const recipientB = key(60);
+    const instruction = unshield(
+      payer.publicKey,
+      pool,
+      state,
+      0,
+      700n,
+      new Uint8Array(32).fill(1),
+      100n,
+      0n,
+      new Uint8Array(32).fill(2),
+      recipient,
+      recipientA,
+      recipientB,
+      new Uint8Array(256),
+      new Uint8Array(320),
+      PROGRAM_ID,
+    );
+    const message = new TransactionMessage({
+      payerKey: payer.publicKey,
+      recentBlockhash: key(120).toBase58(),
+      instructions: [ComputeBudgetProgram.setComputeUnitLimit({ units: 500_000 }), instruction],
+    }).compileToV0Message([lookupTable]);
+    return { message, serializedLength: new VersionedTransaction(message).serialize().length };
+  };
+  const self = compile(payer.publicKey, fixtureTable);
+  const privateSend = compile(bob.publicKey, fixtureTable);
+  const compactPrivateSend = compile(bob.publicKey, compactTable);
+  const loaded = privateSend.message.getAccountKeys({ addressLookupTableAccounts: [fixtureTable] });
+  const loadedKeys = [...loaded.accountKeysFromLookups.writable, ...loaded.accountKeysFromLookups.readonly];
+  assert(loadedKeys.some(address => address.equals(shielded)));
+  assert(loadedKeys.some(address => address.equals(tree)));
+  assert(loadedKeys.some(address => address.equals(custodyA)));
+  assert(loadedKeys.some(address => address.equals(custodyB)));
+  assert(!loadedKeys.some(address => address.equals(bob.publicKey)));
+  assert.equal(self.serializedLength, 1046);
+  assert.equal(privateSend.serializedLength, 1078);
+  assert.equal(privateSend.serializedLength - self.serializedLength, 32);
+  assert.equal(compactPrivateSend.serializedLength, 1233);
+  assert(privateSend.serializedLength <= 1200);
+  assert(privateSend.serializedLength <= 1232);
 });
 
 test("frozen outer-version-1 shield payload decrypts and authenticates", () => {

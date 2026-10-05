@@ -406,6 +406,12 @@ test("shield recovery verifies finalized spent-nullifier account data", async ()
   const encryptedNote = encryptNote(encodeNote(pool, asset, 42n, owner, randomness), keys.viewKey, pool, asset, commitment);
   const noteNullifier = nullifier(pool, asset, keys.spendSecret, randomness);
   const spentAccount = Buffer.concat([accountDiscriminator("SpentNullifier"), pool.toBuffer(), Buffer.from(noteNullifier), Buffer.from([1])]);
+  const foreignSeed = new Uint8Array(32).fill(8);
+  const foreignKeys = keyHierarchy(foreignSeed);
+  const foreignOwner = ownerCommitment(foreignKeys.spendSecret);
+  const foreignRandomness = bytesFor(52);
+  const foreignCommitment = noteCommitment(pool, asset, 43n, foreignOwner, foreignRandomness);
+  const foreignEncryptedNote = encryptNote(encodeNote(pool, asset, 43n, foreignOwner, foreignRandomness), foreignKeys.viewKey, pool, asset, foreignCommitment);
   const sdk = {
     programId,
     connection: {
@@ -414,7 +420,10 @@ test("shield recovery verifies finalized spent-nullifier account data", async ()
     getShieldedState: async () => ({ tokenAMint: asset, tokenBMint: new PublicKey(Uint8Array.from({ length: 32 }, (_, index) => index + 160)) }),
   };
   const provider = {
-    getShieldEvents: async () => [{ asset: 0, amount: 42n, commitment, encryptedNote, index: 0n, pool }],
+    getShieldEvents: async () => [
+      { asset: 0, amount: 43n, commitment: foreignCommitment, encryptedNote: foreignEncryptedNote, index: 0n, pool },
+      { asset: 0, amount: 42n, commitment, encryptedNote, index: 1n, pool },
+    ],
     getSpentNullifiers: async () => [],
   };
   const wallet = new ShieldedWallet(sdk, seed, undefined, provider, new InMemoryNoteStore());

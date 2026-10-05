@@ -114,6 +114,9 @@ also call `recoverShieldedNotes(pool)` with `RpcMerkleWitnessProvider` to scan
 finalized shield events and decrypt the frozen outer-version-1 note envelope.
 Recovery also verifies finalized spent-nullifier PDAs before marking a note
 spent, rather than relying only on event history.
+In a shared pool, envelopes that fail this wallet's view-key authentication are
+foreign-wallet ciphertexts and are ignored; decryptable notes still require
+commitment, owner, and spent-nullifier validation.
 
 Use `exportBackup()` and `importBackup()` for encrypted journal backup and
 restore. Backups contain note randomness and pending operation material and
@@ -130,6 +133,15 @@ protocol convention.
 Unshield and private swap require a validated v0 address lookup table and a
 wallet adapter implementing `signVersionedTransaction`. If the requirement is
 not met, the SDK throws `LookupTableRequiredError` before proving or signing.
+
+For the audited Devnet fixture, configure
+`FMVUyVx6byt3dVV7nmkbXbsu5fLQPM8gTdJwN5YYL9HC` with its frozen address list
+and authority, as `e2e/fixture.mjs` does. That table places the stable
+shielded-state, tree, custody, mint, token-program, and system accounts in the
+LUT while recipient and recipient-ATA accounts remain dynamic. The arbitrary
+recipient Private Send transaction measures 1078 bytes with this table; the
+older partial table `2LDxX9aeVaQhTjcDtwBqCGzA8Nm9MGGCShwnGSKzDYwy` measures
+1233 bytes and must not be used for this flow.
 
 Transactions are confirmed at finalized commitment. A confirmation response
 with a non-null `value.err` is a finalized failure. Timeouts and incomplete

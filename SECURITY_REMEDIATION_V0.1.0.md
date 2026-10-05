@@ -342,21 +342,21 @@ The following were intentionally not changed:
 
 - SDK typecheck: passed.
 - SDK build: passed.
-- SDK tests: 31 passed, including cold/warm/restart incremental Merkle checkpoint, pagination, cache-integrity, gap, provenance, generation, bounded-retry, and spent-nullifier account verification tests.
+- SDK tests: 32 passed, including cold/warm/restart incremental Merkle checkpoint, pagination, transaction-size, cache-integrity, gap, provenance, generation, bounded-retry, and spent-nullifier account verification tests.
 - Production prover tests: passed with zero test failures.
 - Devnet lifecycle and program test crates: compile-checked after IPC migration.
 - Packed npm consumer import: passed outside the monorepo.
 - `npm audit --omit=dev`: 9 accepted residual advisories.
-- SDK release provenance gate: passed for the candidate source commit and recorded package hashes.
+- SDK release provenance gate: passed for the final candidate source commit and separate metadata/provenance commit.
 - Full frozen workspace test suite: passed with the extended timeout; the full-tree capacity test completed successfully.
 - QuickNode incremental profile: cold unshield used 102 HTTP requests and 81 historical transactions; warm unshield used 19 HTTP requests and 2 historical transactions. Cold private swap used 104 HTTP requests and 85 historical transactions; warm private swap used 18 HTTP requests and 2 historical transactions. Warm operations had no 429 responses or duplicate history reads.
-- Real funded QuickNode E2E: preflight passed and a serialized, bounded-rate run observed no 429 responses, but the required six-flow run stopped at Private Send because QuickNode rejected the versioned transaction with JSON-RPC `-32602` (`1233 bytes`, maximum `1232`). No six-flow or restart/recovery success verdict is claimed.
+- Real funded QuickNode E2E: all six required flows passed with the pinned fixture LUT, including Shield, Private Swap, Unshield, Private Send, routed Private Send, and the full A->B->A->Unshield lifecycle. A separate process reopened the encrypted store, authenticated the Merkle checkpoint, verified 9 notes, and found no pending operations.
+- Private Send serialized-size evidence: self-unshield `1046` bytes and arbitrary-recipient Private Send `1078` bytes; the older partial LUT reproduced the rejected `1233`-byte transaction.
 
 ## Release Decision
 
-`BLOCKED`
+`READY FOR RELEASE`
 
-The practical HIGH/MEDIUM implementation work is complete, but `READY FOR
-RELEASE` is not claimed because the final provenance metadata commit and
-required real finalized funded E2E evidence are still pending. No npm
-publication or tag was created.
+The practical HIGH/MEDIUM implementation work, final provenance metadata, and
+required real finalized funded E2E evidence are complete. No npm publication or
+tag was created.

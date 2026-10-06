@@ -110,7 +110,9 @@ The SDK baseline was 31 passed/1 skipped. Generation tests cover PDA compatibili
 fees, active discovery, legacy/new events, rollover parsing, wallet generation
 metadata across a race, old-generation withdrawals, and packet limits. A slow
 full-capacity test reconstructs all 65,535 Gen0 appends, rollover, cross-generation
-swap/unshield events, and a checkpoint restart; it rejects impossible continuation
+swap/unshield events, and a checkpoint restart. It then fills the complete Gen1,
+Gen2, and Gen3 histories and checks a Gen0 witness while Gen2 is active and a Gen1
+witness while Gen4 is active. It rejects impossible continuation
 without overwriting the last good checkpoint. RPC fixtures in SDK unit tests are
 synthetic; real production-key proofs and SBF execution are covered separately by
 the core local integration suite. No new live transaction was broadcast.

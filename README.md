@@ -2,6 +2,12 @@
 
 ## Feature-branch generation update
 
+The defensive-audit remediation is documented in
+[PAGED_MERKLE_AUDIT_REMEDIATION.md](PAGED_MERKLE_AUDIT_REMEDIATION.md): account-only
+pending-output reconciliation, directory-v2 parsing and priority-fee packet
+regressions, paired with prefunding-safe nullifiers and bounded core compute.
+Pending independent re-audit.
+
 The default witness provider now reconstructs depth-16 membership using only
 finalized canonical on-chain page accounts. See
 [ONCHAIN_MERKLE_ARCHIVE.md](ONCHAIN_MERKLE_ARCHIVE.md) for the paired program ABI,

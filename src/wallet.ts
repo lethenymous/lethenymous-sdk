@@ -6,6 +6,7 @@ import { privateSwap as privateSwapIx, shield as shieldIx, unshield as unshieldI
 import { encodePrivateSwapPublicInputs, encodeUnshieldPublicInputs } from "./prover.js";
 import { shieldFee, swapOutputPreservingLpClaims } from "./math.js";
 import { pda } from "./pda.js";
+import { OnChainPagedMerkleWitnessProvider } from "./archive.js";
 import type { JournaledNoteStore, MerkleWitnessProvider, Note, NoteStore, OperationRecord, Prover, ShieldParams } from "./types.js";
 import { transactionSignatureFromBytes, type Lethenymous } from "./client.js";
 
@@ -224,7 +225,7 @@ export class ShieldedWallet {
     const encrypted = encryptNote(encodeNote(input.pool, input.mint, input.amount, this.ownerCommitment, randomness), this.viewKey, input.pool, input.mint, commitment);
     const note: Note = { pool: input.pool, asset: input.mint, amount: input.amount, generation: active.tree.generation, ownerCommitment: this.ownerCommitment, randomness, commitment, encryptedPayload: encrypted, state: "available" };
     const operationId = cryptoRandom(32);
-    await this.begin({ id: operationId, kind: "shield", state: "intent", pool: input.pool, metadata: { asset: input.mint.toBase58(), amount: input.amount.toString(), commitment: key(commitment) }, outputNotes: [note] });
+    await this.begin({ id: operationId, kind: "shield", state: "intent", pool: input.pool, metadata: { asset: input.mint.toBase58(), amount: input.amount.toString(), commitment: key(commitment), outputGeneration: active.tree.generation.toString() }, outputNotes: [note] });
     try {
       const [depositorA, depositorB] = await this.sdk.ensureAtas([{ mint: pool.tokenAMint, owner: this.sdk.wallet.publicKey }, { mint: pool.tokenBMint, owner: this.sdk.wallet.publicKey }]);
       const balance = await getAccount(this.sdk.connection, asset === 0 ? depositorA : depositorB, "finalized", TOKEN_PROGRAM_ID);
@@ -344,7 +345,7 @@ export class ShieldedWallet {
       stateAccount = currentOutput.state;
       if (changeNote) changeNote.generation = currentOutput.tree.generation;
       outputNote.generation = currentOutput.tree.generation;
-      if (journal) await journal.updateOperation(operationId, { outputNotes: [...(changeNote ? [changeNote] : []), outputNote] });
+      if (journal) await journal.updateOperation(operationId, { metadata: {outputGeneration: currentOutput.tree.generation.toString()}, outputNotes: [...(changeNote ? [changeNote] : []), outputNote] });
       const outcome = await this.sdk.buildAndSendOutcome([
         ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }),
         privateSwapIx(this.sdk.wallet.publicKey, pool, stateAccount, direction, witnessValue.root, witnessValue.rootSequence, witnessValue.generation, nullifierValue, input.amountIn, amountOut, changeAmount, changeCommitment, outputCommitment, result.proof, this.sdk.programId, currentOutput.tree),
@@ -419,6 +420,37 @@ export class ShieldedWallet {
     return recovered;
   }
 
+  private async recoverAccountOutputs(operation: OperationRecord): Promise<Note[]> {
+    if (operation.kind === "unshield" || !operation.outputNotes.length) throw new Error("No retained append outputs");
+    const outputs=operation.outputNotes.map(clone),generation=outputs[0].generation;
+    if (generation===undefined || outputs.some(n=>n.generation!==generation || !n.pool.equals(operation.pool))) throw new Error("Unbound expected output generation");
+    if (operation.metadata.outputGeneration!==undefined && BigInt(operation.metadata.outputGeneration)!==generation) throw new Error("Expected generation mismatch");
+    for (const note of outputs) {
+      if (!same(note.ownerCommitment,this.ownerCommitment) || !same(note.commitment,noteCommitment(note.pool,note.asset,note.amount,note.ownerCommitment,note.randomness))) throw new Error("Invalid retained note preimage");
+    }
+    if (operation.kind === "shield") {
+      if (outputs.length!==1 || key(outputs[0].commitment)!==operation.metadata.commitment || outputs[0].amount.toString()!==operation.metadata.amount || outputs[0].asset.toBase58()!==operation.metadata.asset) throw new Error("Shield intent mismatch");
+    } else {
+      const input=(await this.getNotes()).find(n=>operation.inputCommitment && same(n.commitment,operation.inputCommitment));
+      if (!input || !input.pool.equals(operation.pool) || !same(input.ownerCommitment,this.ownerCommitment) || !same(input.commitment,noteCommitment(input.pool,input.asset,input.amount,input.ownerCommitment,input.randomness))) throw new Error("Invalid retained spend input");
+      const nf=nullifier(input.pool,input.asset,this.spendSecret,input.randomness);
+      if (key(nf)!==operation.metadata.nullifier) throw new Error("Spend nullifier mismatch");
+      const accounts=await this.sdk.connection.getMultipleAccountsInfo([pda.spent(operation.pool,nf,this.sdk.programId)[0]],"finalized"),spent=accounts[0];
+      if (accounts.length!==1 || !spent || spent.executable || !spent.owner.equals(this.sdk.programId) || spent.data.length!==73 || !spent.data.subarray(0,8).equals(accountDiscriminator("SpentNullifier")) || !spent.data.subarray(8,40).equals(operation.pool.toBuffer()) || !spent.data.subarray(40,72).equals(Buffer.from(nf)) || spent.data[72]!==1) throw new Error("Canonical finalized spend is unavailable");
+      const amountIn=BigInt(operation.metadata.amountIn),changeAmount=input.amount-amountIn;
+      const output=outputs.at(-1)!;
+      if (amountIn<=0n || changeAmount<0n || outputs.length!==(changeAmount>0n?2:1) || key(output.commitment)!==operation.metadata.outputCommitment || output.amount.toString()!==operation.metadata.amountOut || output.asset.toBase58()!==operation.metadata.assetOut || input.asset.toBase58()!==operation.metadata.assetIn) throw new Error("Swap output intent mismatch");
+      if (changeAmount>0n && (outputs[0].amount!==changeAmount || !outputs[0].asset.equals(input.asset) || key(outputs[0].commitment)!==operation.metadata.changeCommitment)) throw new Error("Swap change intent mismatch");
+      if (changeAmount===0n && operation.metadata.changeCommitment!==key(new Uint8Array(32))) throw new Error("Nonzero change commitment without change");
+    }
+    // Deliberately omit the predicted/stored index: the account provider must
+    // prove a UNIQUE match, not choose the first duplicate or trust an index.
+    const provider=new OnChainPagedMerkleWitnessProvider(this.sdk.connection,this.sdk.programId);
+    for (const output of outputs) {const witness=await provider.getWitness(output.pool,output.commitment,generation);output.leafIndex=witness.index;}
+    if (outputs.length===2 && outputs[1].leafIndex!==outputs[0].leafIndex!+1n) throw new Error("Swap outputs are not ordered contiguous leaves");
+    return outputs;
+  }
+
   async reconcilePending(): Promise<OperationRecord[]> {
     const journal = this.journal();
     if (!journal) return [];
@@ -437,7 +469,19 @@ export class ShieldedWallet {
       if (!operation.signature && !operation.metadata.signature) {
         try { await journal.updateOperation(operation.id, { metadata: { signature } }); } catch { /* Keep the operation pending for the next reconciliation pass. */ }
       }
-      const outcome = await this.sdk.reconcileTransaction(signature, operation.lastValidBlockHeight === undefined ? undefined : Number(operation.lastValidBlockHeight));
+      if (operation.kind!=="unshield") {
+        try {
+          const outputs=await this.recoverAccountOutputs(operation);
+          await journal.updateOperation(operation.id,{outputNotes:outputs});
+          if (operation.inputCommitment) await this.store.markSpent(operation.inputCommitment,operation.id);
+          for (const note of outputs) await this.store.saveNote(note);
+          await journal.markOperationFinalized(operation.id);
+          continue;
+        } catch { /* An optional transaction fast path may still supply evidence. */ }
+      }
+      let outcome;
+      try {outcome = await this.sdk.reconcileTransaction(signature, operation.lastValidBlockHeight === undefined ? undefined : Number(operation.lastValidBlockHeight));}
+      catch {await journal.markOperationUnknown(operation.id,"Canonical outputs or finalized transaction evidence are unavailable");continue;}
       if (outcome.status === "finalized-success") {
         const eventName = operation.kind === "shield" ? "ShieldedNoteAppended" : operation.kind === "unshield" ? "Unshielded" : "PrivateSwapped";
         const needles = Object.values(operation.metadata).filter(value => /^[0-9a-f]{64}$/i.test(value)).map(value => Uint8Array.from(Buffer.from(value, "hex")));

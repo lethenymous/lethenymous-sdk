@@ -1,5 +1,9 @@
 # Account-only paged Merkle witnesses
 
+See [PAGED_MERKLE_AUDIT_REMEDIATION.md](PAGED_MERKLE_AUDIT_REMEDIATION.md) for current
+bounded on-chain SHA checks, account-only pending recovery and priority-fee
+measurements. Original feature-branch measurements below are baseline evidence.
+
 Implemented on `feature/onchain-merkle-pages`, paired with the core archive
 branch. Pending independent audit and devnet validation.
 
@@ -39,7 +43,7 @@ match the commitment and be within the populated range.
 
 ## Account layouts and instruction compatibility
 
-- Directory PDA: `["page-dir", pool, generation_le_u64]`; 1,106 bytes.
+- Directory PDA: `["page-dir", pool, generation_le_u64]`; 1,122 bytes/version2.
 - Page PDA: `["leaf-page", pool, generation_le_u64, page_index_u8]`.
 - A page stores a 597-byte header followed by up to 4,096 raw commitments.
   Maximum size is 131,669 bytes; version is 1.

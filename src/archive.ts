@@ -8,7 +8,7 @@ import { pda } from "./pda.js";
 import type { MerkleWitness, MerkleWitnessProvider } from "./types.js";
 
 export const PAGE_DEPTH = 12, LEAVES_PER_PAGE = 4096, PAGES_PER_GENERATION = 16;
-export const PAGE_DIRECTORY_LEN = 1106, LEAF_PAGE_HEADER_LEN = 597, LEAF_PAGE_MAX_LEN = 131669;
+export const PAGE_DIRECTORY_LEN = 1122, LEAF_PAGE_HEADER_LEN = 597, LEAF_PAGE_MAX_LEN = 131669;
 const MODULUS = 21888242871839275222246405745257275088548364400416034343698204186575808495617n;
 const same = (a: Uint8Array, b: Uint8Array) => Buffer.from(a).equals(Buffer.from(b));
 const sha = (a: Uint8Array) => createHash("sha256").update(a).digest();
@@ -58,7 +58,7 @@ export class OnChainPagedMerkleWitnessProvider implements MerkleWitnessProvider 
     const slot = Number(tree.sequence % 32n), root = rootFromTree(tree);
     requireArchive(tree.rootSequences[slot] === tree.sequence && tree.rootGenerations[slot] === generation && same(root, tree.roots[slot]), "TreeState root history mismatch");
     const directory = owned(accounts[1], this.programId, "PageDirectory");
-    requireArchive(directory.length === PAGE_DIRECTORY_LEN && new PublicKey(directory.subarray(8, 40)).equals(pool) && new PublicKey(directory.subarray(40, 72)).equals(treeAddress) && directory.readBigUInt64LE(72) === generation && directory[1104] === directoryBump && directory[1105] === 1, "PageDirectory binding/version/length mismatch");
+    requireArchive(directory.length === PAGE_DIRECTORY_LEN && new PublicKey(directory.subarray(8, 40)).equals(pool) && new PublicKey(directory.subarray(40, 72)).equals(treeAddress) && directory.readBigUInt64LE(72) === generation && directory[1120] === directoryBump && directory[1121] === 2 && pageAddresses.every((p,i)=>directory[1104+i]===p[1]), "PageDirectory binding/version/length/bump mismatch");
     const roots = Array.from({ length: 16 }, (_, i) => directory.subarray(80 + i * 32, 112 + i * 32));
     requireArchive(roots.every(canonical) && same(subtree(roots, 4).root, root), "Directory is not bound to the generation root");
     const pages: Uint8Array[][] = [], emptyPageRoot = subtree([], 12).root;

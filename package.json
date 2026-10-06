@@ -18,6 +18,7 @@
     "MERKLE_GENERATIONS.md",
     "CHECKPOINT_SCALABILITY.md",
     "ONCHAIN_MERKLE_ARCHIVE.md",
+    "PAGED_MERKLE_AUDIT_REMEDIATION.md",
     "LICENSE"
   ],
   "main": "./dist/index.js",

@@ -1,5 +1,6 @@
 import { PublicKey, TransactionInstruction } from "@solana/web3.js";
 import type { PoolState, ShieldedState } from "./types.js";
+export declare function rolloverTree(payer: PublicKey, pool: PublicKey, currentGeneration: bigint, programId?: PublicKey): TransactionInstruction;
 export declare function initializePool(payer: PublicKey, authority: PublicKey, creator: PublicKey, a: PublicKey, b: PublicKey, feeBps: number, programId?: PublicKey): TransactionInstruction;
 export declare function initializeShieldedState(payer: PublicKey, pool: PublicKey, state?: ShieldedState, programId?: PublicKey): TransactionInstruction;
 export declare function addLiquidity(provider: PublicKey, pool: PoolState, providerA: PublicKey, providerB: PublicKey, providerLp: PublicKey, a: bigint, b: bigint, minLp: bigint, programId?: PublicKey): TransactionInstruction;

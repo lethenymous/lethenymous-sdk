@@ -4,7 +4,8 @@ import { ASSOCIATED_TOKEN_PROGRAM_ID, createAssociatedTokenAccountIdempotentInst
 import { accountDiscriminator, PROGRAM_ID } from "./encoding.js";
 import { decodePool, decodeProtocolConfig, decodeShieldedState, decodeTreeState } from "./accounts.js";
 import { pda } from "./pda.js";
-import { addLiquidity as addLiquidityIx, initializePool, initializeShieldedState, removeLiquidity as removeLiquidityIx, swap as swapIx } from "./instructions.js";
+import { addLiquidity as addLiquidityIx, initializePool, initializeShieldedState, removeLiquidity as removeLiquidityIx, rolloverTree, swap as swapIx } from "./instructions.js";
+import { TREE_CAPACITY } from "./merkle.js";
 import { swapOutputPreservingLpClaims } from "./math.js";
 import { keyHierarchy, ownerCommitment } from "./crypto.js";
 import { EncryptedFileNoteStore } from "./store.js";
@@ -93,15 +94,47 @@ export class Lethenymous {
     }
     async getShieldedState(pool) {
         const state = decodeShieldedState(await this.account(pda.shielded(pool, this.programId)[0], "ShieldedState"));
-        if (!state.pool.equals(pool) || !state.tree.equals(pda.tree(pool, this.programId)[0]))
+        if (!state.pool.equals(pool))
             throw new Error("Shielded state does not match pool");
         return state;
     }
     async getTree(pool) {
-        const tree = decodeTreeState(await this.account(pda.tree(pool, this.programId)[0], "TreeState"));
-        if (!tree.pool.equals(pool))
+        return (await this.getActiveTree(pool)).tree;
+    }
+    async getTreeAt(address, pool) {
+        const tree = decodeTreeState(await this.account(address, "TreeState"));
+        if (pool && !tree.pool.equals(pool))
             throw new Error("Tree does not match pool");
+        if (!address.equals(pda.tree(tree.pool, tree.generation, this.programId)[0]))
+            throw new Error("Tree generation/PDA mismatch");
         return tree;
+    }
+    async getTreeByGeneration(pool, generation) {
+        return this.getTreeAt(pda.tree(pool, generation, this.programId)[0], pool);
+    }
+    async getActiveTree(pool) {
+        const state = await this.getShieldedState(pool);
+        const tree = await this.getTreeAt(state.tree, pool);
+        return { address: state.tree, tree, state };
+    }
+    async ensureTreeCapacity(pool, requiredLeaves) {
+        for (let attempt = 0; attempt < 3; attempt++) {
+            const active = await this.getActiveTree(pool);
+            const remaining = TREE_CAPACITY - active.tree.nextIndex;
+            if (remaining < 0n)
+                throw new Error("Invalid active tree capacity");
+            if (remaining >= BigInt(requiredLeaves))
+                return active;
+            try {
+                await this.buildAndSend([rolloverTree(this.wallet.publicKey, pool, active.tree.generation, this.programId)]);
+            }
+            catch (error) {
+                const refreshed = await this.getActiveTree(pool);
+                if (refreshed.tree.generation <= active.tree.generation)
+                    throw error;
+            }
+        }
+        throw new Error("Active tree kept changing during rollover; retry from finalized state");
     }
     async getProtocolConfig() {
         return decodeProtocolConfig(await this.account(pda.protocolConfig(this.programId)[0], "ProtocolConfig"));
@@ -201,6 +234,8 @@ export class Lethenymous {
             raw = await this.wallet.signTransaction(transaction);
         }
         const serialized = raw.serialize();
+        if (serialized.length > 1232)
+            throw new Error(`Transaction exceeds Solana packet limit: ${serialized.length} > 1232`);
         if (options.onPrepared)
             await options.onPrepared(serialized, BigInt(latest.lastValidBlockHeight));
         let signature;
@@ -241,7 +276,9 @@ export class Lethenymous {
         try {
             const status = (await this.connection.getSignatureStatuses([signature], { searchTransactionHistory: true })).value[0];
             if (status?.confirmationStatus === "finalized")
-                return { status: "finalized-success", signature };
+                return status.err == null
+                    ? { status: "finalized-success", signature }
+                    : { status: "finalized-failed", signature, error: status.err };
             const transaction = await this.connection.getTransaction(signature, { commitment: "finalized", maxSupportedTransactionVersion: 0 });
             if (transaction?.meta?.err !== null && transaction?.meta?.err !== undefined)
                 return { status: "finalized-failed", signature, error: transaction.meta.err };
@@ -346,7 +383,11 @@ export class Lethenymous {
     }
     async validatePrivateTransactionReady(instructions) {
         this.assertPrivateTransactionReady();
-        await this.validatedTables(instructions);
+        const tables = await this.validatedTables(instructions);
+        const message = new TransactionMessage({ payerKey: this.wallet.publicKey, recentBlockhash: PublicKey.default.toBase58(), instructions }).compileToV0Message(tables);
+        const size = new VersionedTransaction(message).serialize().length;
+        if (size > 1232)
+            throw new Error(`Private transaction exceeds Solana packet limit: ${size} > 1232; configure a sufficient static pool LUT`);
     }
     shieldedWallet(seed, prover, options = {}) {
         const noteStore = options.noteStore ?? (options.storagePath ? EncryptedFileNoteStore.fromSeed(options.storagePath, seed, ownerCommitment(keyHierarchy(seed).spendSecret)) : undefined);

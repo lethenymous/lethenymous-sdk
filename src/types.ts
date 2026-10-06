@@ -95,7 +95,7 @@ export interface MerkleWitness {
 }
 
 export interface MerkleWitnessProvider {
-  getWitness(pool: PublicKey, commitment: Uint8Array): Promise<MerkleWitness>;
+  getWitness(pool: PublicKey, commitment: Uint8Array, generation?: bigint): Promise<MerkleWitness>;
 }
 
 /** Implementations must authenticate checkpoint bytes and make replacement writes crash-safe. */
@@ -115,6 +115,8 @@ export interface Note {
   commitment: Uint8Array;
   encryptedPayload?: Uint8Array;
   leafIndex?: bigint;
+  /** Legacy stored notes without this metadata normalize to generation zero. */
+  generation?: bigint;
   state?: NoteState;
   operationId?: Uint8Array;
   transactionSignature?: string;

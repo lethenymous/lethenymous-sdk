@@ -24,6 +24,7 @@ export interface PrivateSwapEvent {
     rootSequence: bigint;
     generation: bigint;
     nullifier: Uint8Array;
+    outputGeneration: bigint;
     changeCommitment: Uint8Array;
     outputCommitment: Uint8Array;
     changeIndex?: bigint;
@@ -44,28 +45,45 @@ export interface UnshieldEvent {
     signature: string;
 }
 export type ShieldedAppendEvent = ShieldAppendEvent | PrivateSwapEvent;
+export interface TreeRolloverEvent {
+    kind: "rollover";
+    pool: PublicKey;
+    previousTree: PublicKey;
+    previousGeneration: bigint;
+    previousFinalRoot: Uint8Array;
+    newTree: PublicKey;
+    newGeneration: bigint;
+    signature: string;
+    slot: number;
+}
+export type HistoryEvent = ShieldedAppendEvent | UnshieldEvent | TreeRolloverEvent;
 export type MerkleReconstructionErrorCode = "INVALID_CHECKPOINT" | "HISTORY_GAP" | "HISTORY_RPC" | "GENERATION_MISMATCH" | "SEQUENCE_GAP" | "ROOT_MISMATCH" | "TRANSACTION_MISSING" | "FAILED_TRANSACTION" | "DUPLICATE_EVENT" | "INVALID_TREE";
 export declare class MerkleReconstructionError extends Error {
     readonly code: MerkleReconstructionErrorCode;
     constructor(code: MerkleReconstructionErrorCode, message: string);
 }
+export declare function parseShieldedEvent(data: Buffer, signature: string, slot: number): HistoryEvent | undefined;
 export declare class RpcMerkleWitnessProvider implements MerkleWitnessProvider {
     private readonly connection;
     private readonly programId;
     private readonly getTree;
     private readonly checkpointStore?;
+    private readonly getGenerationTree?;
     private readonly states;
     private readonly syncing;
     private genesisHash?;
-    constructor(connection: Connection, programId: PublicKey, getTree: (pool: PublicKey) => Promise<TreeState>, checkpointStore?: MerkleCheckpointStore | undefined);
+    constructor(connection: Connection, programId: PublicKey, getTree: (pool: PublicKey) => Promise<TreeState>, checkpointStore?: MerkleCheckpointStore | undefined, getGenerationTree?: ((pool: PublicKey, generation: bigint) => Promise<TreeState>) | undefined);
     private getGenesisIdentity;
     private identity;
     private loadCheckpoint;
     private collectRows;
     private transaction;
+    private historicalTree;
+    private poolCheckpointBytes;
+    private savePoolCheckpoint;
     private syncPool;
     private load;
     getShieldEvents(pool: PublicKey): Promise<ShieldAppendEvent[]>;
     getSpentNullifiers(pool: PublicKey): Promise<Uint8Array[]>;
-    getWitness(pool: PublicKey, commitment: Uint8Array): Promise<MerkleWitness>;
+    getWitness(pool: PublicKey, commitment: Uint8Array, generation?: bigint): Promise<MerkleWitness>;
 }

@@ -1,5 +1,13 @@
 # @lethenymous/sdk
 
+## Feature-branch generation update
+
+See [MERKLE_GENERATIONS.md](MERKLE_GENERATIONS.md) for the new generation-aware
+program ABI, 5-bps extra shield fee, history/checkpoint migration, and local
+validation. These branch changes have not been deployed or published and are
+pending independent source review and devnet adversarial validation. Historical
+v0.1.0 audit reports describe the earlier implementation.
+
 TypeScript protocol client for the frozen Lethenymous / zkCPMM program.
 
 ## Status

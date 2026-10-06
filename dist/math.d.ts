@@ -1,5 +1,7 @@
 export declare const FEE_DENOMINATOR = 10000n;
 export declare const MINIMUM_LIQUIDITY = 1000n;
+export declare const SHIELD_FEE_BPS = 5n;
+export declare function shieldFee(amount: bigint): bigint;
 export interface FeeBreakdown {
     totalFee: bigint;
     protocolFee: bigint;

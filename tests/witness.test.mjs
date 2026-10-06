@@ -147,7 +147,7 @@ function transaction(signature, slot, data, transactionProgram = programId) {
     meta: { err: null, loadedAddresses: undefined, logMessages: logs },
     transaction: {
       message: {
-        getAccountKeys: () => ({ get: index => index === 0 ? transactionProgram : treeAddress }),
+        getAccountKeys: () => ({ get: index => index === 0 ? transactionProgram : pda.shielded(pool, programId)[0] }),
         compiledInstructions: [{ programIdIndex: 0, accountKeyIndexes: [1] }],
       },
       signatures: [signature],
@@ -155,6 +155,42 @@ function transaction(signature, slot, data, transactionProgram = programId) {
     signature,
   };
 }
+
+test("full-capacity replay authenticates rollover, cross-generation outputs, and checkpoint restart", { timeout: 900_000 }, async()=>{
+  const old=emptyTree();const history=[];const transactions=new Map();
+  const commitment=bytesFor(61);
+  // Full append history is intentionally generated, rather than injecting a
+  // trusted frontier/checkpoint that could hide missing rollover prerequisites.
+  for(let index=0;index<Number(TREE_CAPACITY)-1;index++){
+    const result=append(old,commitment);
+    addRow(history,transactions,shieldData(commitment,result),index+1,`generation-leaf-${index}`);
+  }
+  const active=emptyTree();active.generation=1n;active.rootGenerations[0]=1n;
+  const rollover=Buffer.concat([eventId("TreeRolledOver"),pool.toBuffer(),pda.tree(pool,0n,programId)[0].toBuffer(),u64(0),Buffer.from(rootFromTree(old)),pda.tree(pool,1n,programId)[0].toBuffer(),u64(1)]);
+  addRow(history,transactions,rollover,65536,"generation-rollover");
+  const change=bytesFor(62),output=bytesFor(63);
+  append(active,change);append(active,output);
+  const cross=Buffer.concat([swapData(change,output,rootFromTree(old),old.sequence,0n,1n),u64(1)]);
+  addRow(history,transactions,cross,65537,"generation-cross-swap");
+  addRow(history,transactions,unshieldData(bytesFor(64),old.sequence),65538,"generation-old-unshield");
+  let checkpoint;
+  const checkpoints=new Map();
+  const store={loadMerkleCheckpoint:async identity=>checkpoints.get(identity),saveMerkleCheckpoint:async(identity,bytes)=>{checkpoints.set(identity,bytes);checkpoint=bytes;}};
+  const connection=fakeConnection(history,transactions,{signatures:0,transactions:[]});
+  const provider=new RpcMerkleWitnessProvider(connection,programId,async()=>active,store,async(_pool,g)=>g===0n?old:active);
+  const w=await provider.getWitness(pool,commitment);assert.equal(w.generation,0n);assert.equal(w.rootSequence,65535n);assert.deepEqual(w.root,Uint8Array.from(rootFromTree(old)));
+  const out=await provider.getWitness(pool,output);assert.equal(out.generation,1n);assert.equal(out.index,1n);
+  assert.equal(JSON.parse(Buffer.from(checkpoint).toString()).formatVersion,2);
+  const restartedCalls={signatures:0,transactions:[]};
+  const restarted=new RpcMerkleWitnessProvider(fakeConnection(history,transactions,restartedCalls),programId,async()=>active,store,async(_pool,g)=>g===0n?old:active);
+  assert.deepEqual(await restarted.getWitness(pool,output),out);assert.equal(restartedCalls.transactions.length,0);
+  assert((await restarted.getSpentNullifiers(pool)).some(v=>Buffer.from(v).equals(Buffer.from(bytesFor(9)))));
+  // Invalid continuation is rejected without persisting a new checkpoint.
+  const before=checkpoint;
+  addRow(history,transactions,Buffer.concat([rollover.subarray(0,144),u64(3)]),65539,"impossible-rollover");
+  await assert.rejects(()=>restarted.getWitness(pool,output),e=>e instanceof MerkleReconstructionError&&e.code==="GENERATION_MISMATCH");
+  assert.equal(checkpoint,before);
+});
 
 function fakeConnection(history, transactions, calls, overrides = {}) {
   return {
@@ -267,6 +303,33 @@ test("cold sync paginates the complete finalized signature history", async () =>
   }
 });
 
+test("authenticated CPI append history is reconstructed through the stable pool account",async()=>{
+  const current=emptyTree(),leaf=bytesFor(71),result=append(current,leaf);
+  const history=[],transactions=new Map();addRow(history,transactions,shieldData(leaf,result),10,"cpi-shield");
+  const wrapper=new PublicKey(new Uint8Array(32).fill(72));
+  const tx=transactions.get("cpi-shield");
+  tx.transaction.message.getAccountKeys=()=>({get:i=>[wrapper,programId,pda.shielded(pool,programId)[0]][i]});
+  tx.transaction.message.compiledInstructions=[{programIdIndex:0,accountKeyIndexes:[2]}];
+  tx.meta.innerInstructions=[{index:0,instructions:[{programIdIndex:1,accounts:[2],data:""}]}];
+  tx.meta.logMessages=[`Program ${wrapper} invoke [1]`,...tx.meta.logMessages,`Program ${wrapper} success`];
+  const provider=new RpcMerkleWitnessProvider(fakeConnection(history,transactions,{signatures:0,transactions:[]}),programId,async()=>current);
+  assert.equal((await provider.getWitness(pool,leaf)).index,0n);
+});
+
+test("authenticated v1 tree checkpoints rebuild the pool stream without reusing the old cursor",async()=>{
+  const current=emptyTree(),leaf=bytesFor(73),result=append(current,leaf),history=[],transactions=new Map(),calls={signatures:0,transactions:[]};
+  const signature=addRow(history,transactions,shieldData(leaf,result),20,"legacy-shield");
+  const h=v=>Buffer.from(v).toString("hex");
+  const identity={genesisHash:"genesis-test",programId:programId.toBase58(),pool:pool.toBase58(),tree:treeAddress.toBase58(),generation:"0"};
+  const base={formatVersion:1,identity,tree:{pool:pool.toBase58(),generation:"0",nextIndex:"1",sequence:"1",frontier:current.frontier.map(h),frontierPresent:current.frontierPresent,emptySubtrees:current.emptySubtrees.map(h),roots:current.roots.map(h),rootSequences:current.rootSequences.map(String),rootGenerations:current.rootGenerations.map(String)},cursor:{lastProcessedSignature:signature,lastFinalizedSlot:20},appends:[{index:"0",sequence:"1",commitment:h(leaf),event:{kind:"shield",pool:pool.toBase58(),asset:0,amount:"42",commitment:h(leaf),encryptedNote:Buffer.concat([Buffer.from([1]),Buffer.alloc(185)]).toString("hex"),root:h(result.root),generation:"0",index:"0",sequence:"1",slot:20,signature}}],spentNullifiers:[],reconstructedRoot:h(result.root)};
+  const legacy=Buffer.from(JSON.stringify({...base,integrity:{algorithm:"sha256",digest:createHash("sha256").update(JSON.stringify(base)).digest("hex")}}));
+  const checkpoints=new Map([[JSON.stringify(identity),legacy]]);
+  const store={loadMerkleCheckpoint:async key=>checkpoints.get(key),saveMerkleCheckpoint:async(key,value)=>{checkpoints.set(key,value);}};
+  const provider=new RpcMerkleWitnessProvider(fakeConnection(history,transactions,calls),programId,async()=>current,store);
+  assert.equal((await provider.getWitness(pool,leaf)).generation,0n);assert.deepEqual(calls.transactions,[signature]);
+  assert([...checkpoints.values()].some(value=>JSON.parse(Buffer.from(value).toString()).formatVersion===2));
+});
+
 test("corrupted checkpoints fail closed with a typed reconstruction error", async () => {
   const directory = await mkdtemp(join(tmpdir(), "zkcpmm-witness-corrupt-"));
   try {
@@ -344,10 +407,11 @@ test("429 history reads use bounded retries and finalized failures do not advanc
     const failedProvider = new RpcMerkleWitnessProvider(
       fakeConnection(failedHistory, new Map([["signature-failed", failedTransaction]]), { signatures: 0, transactions: [] }),
       programId,
-      async () => ({ ...failedTree, ...currentTree }),
+      async () => failedTree,
       storeFor(join(directory, "failed.lnsj")),
     );
-    await assert.rejects(() => failedProvider.getWitness(pool, leaf), error => error instanceof MerkleReconstructionError && error.code === "FAILED_TRANSACTION");
+    assert.deepEqual(await failedProvider.getSpentNullifiers(pool), []);
+    await assert.rejects(() => failedProvider.getWitness(pool, leaf), /not present/);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

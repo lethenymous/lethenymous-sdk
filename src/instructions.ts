@@ -18,6 +18,13 @@ function ix(name: string, args: Buffer, accounts: AccountMeta[], programId: Publ
   return new TransactionInstruction({ programId, keys: accounts, data: concat(discriminator(name), args) });
 }
 
+export function rolloverTree(payer: PublicKey, pool: PublicKey, currentGeneration: bigint, programId: PublicKey = PROGRAM_ID): TransactionInstruction {
+  return ix("rollover_tree", u64(currentGeneration + 1n), [
+    signer(payer), ro(pool), rw(pda.shielded(pool, programId)[0]), ro(pda.tree(pool, currentGeneration, programId)[0]),
+    rw(pda.tree(pool, currentGeneration + 1n, programId)[0]), ro(SystemProgram.programId),
+  ], programId);
+}
+
 export function initializePool(
   payer: PublicKey,
   authority: PublicKey,
@@ -88,7 +95,7 @@ export function shield(
   return ix("shield", concat(enumByte(asset), u64(amount), bytes32(owner), bytes32(randomness), vec(encrypted)), [
     signer(depositor), ro(pool.address), rw(pda.shielded(pool.address, programId)[0]), rw(state.tree),
     ro(pool.tokenAMint), ro(pool.tokenBMint), rw(state.custodyA), rw(state.custodyB),
-    rw(depositorA), rw(depositorB), ro(TOKEN_PROGRAM_ID),
+    rw(depositorA), rw(depositorB), rw(asset === 0 ? pool.protocolFeeVaultA : pool.protocolFeeVaultB), ro(TOKEN_PROGRAM_ID),
   ], programId);
 }
 
@@ -146,7 +153,7 @@ export function unshield(
   programId: PublicKey = PROGRAM_ID,
 ): TransactionInstruction {
   return ix("unshield", concat(enumByte(asset), bytes32(root), u64(rootSequence), u64(generation), u64(amount), bytes32(nullifierValue), vec(proof), vec(publicInputs)), [
-    signer(payer), ro(pool.address), rw(pda.shielded(pool.address, programId)[0]), rw(state.tree),
+    signer(payer), ro(pool.address), ro(pda.shielded(pool.address, programId)[0]), ro(pda.tree(pool.address, generation, programId)[0]),
     ro(pool.tokenAMint), ro(pool.tokenBMint), rw(state.custodyA), rw(state.custodyB), ro(recipient),
     rw(recipientA), rw(recipientB), rw(pda.spent(pool.address, nullifierValue, programId)[0]),
     ro(TOKEN_PROGRAM_ID), ro(SystemProgram.programId),
@@ -171,7 +178,7 @@ export function privateSwap(
   programId: PublicKey = PROGRAM_ID,
 ): TransactionInstruction {
   return ix("private_swap", concat(enumByte(direction), bytes32(root), u64(rootSequence), u64(generation), bytes32(nullifierValue), u64(amountIn), u64(amountOut), u64(changeAmount), bytes32(changeCommitment), bytes32(outputCommitment), vec(proof)), [
-    signer(payer), rw(pool.address), rw(pda.shielded(pool.address, programId)[0]), rw(state.tree),
+    signer(payer), rw(pool.address), rw(pda.shielded(pool.address, programId)[0]), ro(pda.tree(pool.address, generation, programId)[0]), rw(state.tree),
     rw(pool.tokenAMint), rw(pool.tokenBMint), ro(pool.lpMint), rw(pool.tokenAVault), rw(pool.tokenBVault),
     rw(pool.protocolFeeVaultA), rw(pool.protocolFeeVaultB), rw(pool.creatorFeeVaultA), rw(pool.creatorFeeVaultB),
     rw(state.custodyA), rw(state.custodyB), ro(TOKEN_PROGRAM_ID), ro(SystemProgram.programId),

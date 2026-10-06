@@ -1,5 +1,11 @@
 export const FEE_DENOMINATOR = 10000n;
 export const MINIMUM_LIQUIDITY = 1000n;
+export const SHIELD_FEE_BPS = 5n;
+export function shieldFee(amount) {
+    if (typeof amount !== "bigint" || amount < 0n || amount > 0xffffffffffffffffn)
+        throw new Error("Shield amount must be a u64 bigint");
+    return amount * SHIELD_FEE_BPS / FEE_DENOMINATOR;
+}
 export function validateFeeTier(feeBps) {
     if (!Number.isInteger(feeBps) || ![100, 200, 300].includes(feeBps))
         throw new Error("Invalid fee tier");

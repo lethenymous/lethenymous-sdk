@@ -43,6 +43,18 @@ export declare class Lethenymous {
     getPool(address: PublicKey): Promise<PoolState>;
     getShieldedState(pool: PublicKey): Promise<ShieldedState>;
     getTree(pool: PublicKey): Promise<TreeState>;
+    getTreeAt(address: PublicKey, pool?: PublicKey): Promise<TreeState>;
+    getTreeByGeneration(pool: PublicKey, generation: bigint): Promise<TreeState>;
+    getActiveTree(pool: PublicKey): Promise<{
+        address: PublicKey;
+        tree: TreeState;
+        state: ShieldedState;
+    }>;
+    ensureTreeCapacity(pool: PublicKey, requiredLeaves: 1 | 2): Promise<{
+        address: PublicKey;
+        tree: TreeState;
+        state: ShieldedState;
+    }>;
     getProtocolConfig(): Promise<ProtocolConfig>;
     getReserves(pool: PoolState): Promise<{
         a: bigint;

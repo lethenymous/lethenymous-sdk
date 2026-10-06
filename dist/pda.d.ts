@@ -10,7 +10,7 @@ export declare const pda: {
     lpMint: (pool: PublicKey, programId?: PublicKey) => [PublicKey, number];
     lpLock: (pool: PublicKey, programId?: PublicKey) => [PublicKey, number];
     shielded: (pool: PublicKey, programId?: PublicKey) => [PublicKey, number];
-    tree: (pool: PublicKey, programId?: PublicKey) => [PublicKey, number];
+    tree: (pool: PublicKey, generationOrProgram?: bigint | PublicKey, programId?: PublicKey) => [PublicKey, number];
     custodyA: (pool: PublicKey, programId?: PublicKey) => [PublicKey, number];
     custodyB: (pool: PublicKey, programId?: PublicKey) => [PublicKey, number];
     spent: (pool: PublicKey, nullifier: Uint8Array, programId?: PublicKey) => [PublicKey, number];

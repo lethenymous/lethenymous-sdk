@@ -1,5 +1,10 @@
 export const FEE_DENOMINATOR = 10_000n;
 export const MINIMUM_LIQUIDITY = 1_000n;
+export const SHIELD_FEE_BPS = 5n;
+export function shieldFee(amount: bigint): bigint {
+  if (typeof amount !== "bigint" || amount < 0n || amount > 0xffffffffffffffffn) throw new Error("Shield amount must be a u64 bigint");
+  return amount * SHIELD_FEE_BPS / FEE_DENOMINATOR;
+}
 
 export interface FeeBreakdown {
   totalFee: bigint;

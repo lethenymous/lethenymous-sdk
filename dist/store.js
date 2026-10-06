@@ -22,6 +22,7 @@ const idOf = (value) => hex(value);
 function cloneNote(note) {
     return {
         ...note,
+        generation: note.generation ?? 0n,
         ownerCommitment: Uint8Array.from(note.ownerCommitment),
         randomness: Uint8Array.from(note.randomness),
         commitment: Uint8Array.from(note.commitment),
@@ -44,6 +45,7 @@ function serializeNote(note) {
         commitment: hex(note.commitment),
         encryptedPayload: note.encryptedPayload ? hex(note.encryptedPayload) : undefined,
         leafIndex: note.leafIndex?.toString(),
+        generation: (note.generation ?? 0n).toString(),
         state: noteState(note),
         operationId: note.operationId ? hex(note.operationId) : undefined,
         transactionSignature: note.transactionSignature,
@@ -59,6 +61,7 @@ function deserializeNote(value) {
         commitment: bytes(String(value.commitment)),
         encryptedPayload: typeof value.encryptedPayload === "string" ? bytes(value.encryptedPayload) : undefined,
         leafIndex: value.leafIndex === undefined ? undefined : BigInt(String(value.leafIndex)),
+        generation: value.generation === undefined ? 0n : BigInt(String(value.generation)),
         state: String(value.state),
         operationId: typeof value.operationId === "string" ? bytes(value.operationId) : undefined,
         transactionSignature: typeof value.transactionSignature === "string" ? value.transactionSignature : undefined,
@@ -115,6 +118,8 @@ export class EncryptedFileNoteStore {
         return new EncryptedFileNoteStore(path, noteStoreKey(seed), owner);
     }
     validateNote(note) {
+        if (note.generation !== undefined && (note.generation < 0n || note.generation > 0xffffffffffffffffn))
+            throw new Error("Invalid note generation");
         if (note.state !== undefined && !["available", "reserved", "submitted", "spent"].includes(note.state))
             throw new Error("Invalid note state");
         if (note.amount <= 0n || note.ownerCommitment.length !== 32 || note.randomness.length !== 32 || note.commitment.length !== 32)

@@ -1,11 +1,15 @@
 import { createHash } from "node:crypto";
 import { PublicKey } from "@solana/web3.js";
 import { hash2 } from "./crypto.js";
+import { accountDiscriminator } from "./encoding.js";
+import { decodeTreeState } from "./accounts.js";
+import { pda } from "./pda.js";
 import { ROOT_HISTORY, TREE_CAPACITY, TREE_DEPTH, rootFromTree, verifyPath } from "./merkle.js";
 const eventId = (name) => createHash("sha256").update(`event:${name}`).digest().subarray(0, 8);
 const SHIELD = eventId("ShieldedNoteAppended");
 const SWAP = eventId("PrivateSwapped");
 const UNSHIELD = eventId("Unshielded");
+const ROLLOVER = eventId("TreeRolledOver");
 const BN254_MODULUS = 21888242871839275222246405745257275088548364400416034343698204186575808495617n;
 const CHECKPOINT_VERSION = 1;
 const same = (a, b) => Buffer.from(a).equals(Buffer.from(b));
@@ -131,6 +135,7 @@ function serializeEvent(event) {
         root: hex(event.root),
         rootSequence: event.rootSequence.toString(),
         generation: event.generation.toString(),
+        outputGeneration: event.outputGeneration.toString(),
         nullifier: hex(event.nullifier),
         changeCommitment: hex(event.changeCommitment),
         outputCommitment: hex(event.outputCommitment),
@@ -170,6 +175,7 @@ function deserializeEvent(value) {
             root: parseBytes(event.root, 32, "swap root"),
             rootSequence: parseBigInt(event.rootSequence, "swap root sequence"),
             generation: parseBigInt(event.generation, "swap generation"),
+            outputGeneration: event.outputGeneration === undefined ? parseBigInt(event.generation, "swap generation") : parseBigInt(event.outputGeneration, "swap output generation"),
             nullifier: parseBytes(event.nullifier, 32, "swap nullifier"),
             changeCommitment: parseBytes(event.changeCommitment, 32, "swap change commitment"),
             outputCommitment: parseBytes(event.outputCommitment, 32, "swap output commitment"),
@@ -330,6 +336,8 @@ function recordSpentNullifier(state, nullifier) {
     state.spentNullifiers.add(value);
 }
 function applyEvent(state, pool, event) {
+    if (event.kind === "rollover")
+        reconstruction("GENERATION_MISMATCH", "Legacy checkpoint cannot contain rollover");
     assertIdentity(pool, event);
     if (event.generation !== state.tree.generation)
         reconstruction("GENERATION_MISMATCH", `History event generation ${event.generation} does not match ${state.tree.generation}`);
@@ -517,10 +525,13 @@ function messageHasProgramInstruction(transaction, programId, treeAddress) {
     const message = transaction.transaction.message;
     const loaded = transaction.meta?.loadedAddresses;
     const keys = message.getAccountKeys(loaded ? { accountKeysFromLookups: loaded } : undefined);
-    return message.compiledInstructions.some(instruction => {
+    const direct = message.compiledInstructions.some(instruction => {
         const instructionProgram = keys.get(instruction.programIdIndex);
         return instructionProgram?.equals(programId) === true && instruction.accountKeyIndexes.some(index => keys.get(index)?.equals(treeAddress) === true);
     });
+    if (direct)
+        return true;
+    return (transaction.meta?.innerInstructions ?? []).some(group => group.instructions.some(instruction => keys.get(instruction.programIdIndex)?.equals(programId) === true && instruction.accounts.some(index => keys.get(index)?.equals(treeAddress) === true)));
 }
 function programEventLogs(transaction, programId) {
     const logs = transaction.meta?.logMessages ?? [];
@@ -544,7 +555,7 @@ function programEventLogs(transaction, programId) {
     }
     return result;
 }
-function parseEvent(data, signature, slot) {
+export function parseShieldedEvent(data, signature, slot) {
     if (data.subarray(0, 8).equals(SHIELD)) {
         if (data.length < 85)
             throw new Error("Malformed shield event");
@@ -572,7 +583,7 @@ function parseEvent(data, signature, slot) {
         return { kind: "shield", pool, asset, amount, commitment: Uint8Array.from(commitment), encryptedNote: Uint8Array.from(encryptedNote), root: Uint8Array.from(root), generation, index, sequence: index + 1n, slot, signature };
     }
     if (data.subarray(0, 8).equals(SWAP)) {
-        if (data.length !== 210 && data.length !== 218)
+        if (![210, 218, 226].includes(data.length))
             throw new Error("Malformed private-swap event length");
         let offset = 8;
         const pool = pubkey(data, offset);
@@ -598,17 +609,19 @@ function parseEvent(data, signature, slot) {
         if (hasChangeValue > 1)
             throw new Error("Private-swap event has an invalid change flag");
         const hasChange = hasChangeValue === 1;
-        if (direction > 1 || amountIn === 0n || amountOut === 0n || !canonicalField(root) || !canonicalField(nullifier) || same(nullifier, new Uint8Array(32)) || !canonicalField(outputCommitment) || (hasChange && !canonicalField(changeCommitment)) || same(outputCommitment, new Uint8Array(32)) || (hasChange && data.length !== 218) || (!hasChange && data.length !== 210))
+        const legacyLength = hasChange ? 218 : 210;
+        if (direction > 1 || amountIn === 0n || amountOut === 0n || !canonicalField(root) || !canonicalField(nullifier) || same(nullifier, new Uint8Array(32)) || !canonicalField(outputCommitment) || (hasChange && !canonicalField(changeCommitment)) || same(outputCommitment, new Uint8Array(32)) || (data.length !== legacyLength && data.length !== legacyLength + 8))
             throw new Error("Malformed private-swap event fields");
         const changeIndex = hasChange ? u64(data, offset) : undefined;
         if (hasChange)
             offset += 8;
         const outputIndex = u64(data, offset);
+        const outputGeneration = data.length === legacyLength ? generation : u64(data, offset + 8);
         if (!hasChange && !same(changeCommitment, new Uint8Array(32)))
             throw new Error("Private-swap event has a change commitment without an index");
         if (hasChange && same(changeCommitment, new Uint8Array(32)))
             throw new Error("Private-swap event has an empty change commitment");
-        return { kind: "swap", pool, direction, amountIn, amountOut, root: Uint8Array.from(root), rootSequence, generation, nullifier: Uint8Array.from(nullifier), changeCommitment: Uint8Array.from(changeCommitment), outputCommitment: Uint8Array.from(outputCommitment), changeIndex, outputIndex, slot, signature };
+        return { kind: "swap", pool, direction, amountIn, amountOut, root: Uint8Array.from(root), rootSequence, generation, outputGeneration, nullifier: Uint8Array.from(nullifier), changeCommitment: Uint8Array.from(changeCommitment), outputCommitment: Uint8Array.from(outputCommitment), changeIndex, outputIndex, slot, signature };
     }
     if (data.subarray(0, 8).equals(UNSHIELD)) {
         if (data.length !== 129)
@@ -629,6 +642,12 @@ function parseEvent(data, signature, slot) {
         if (asset > 1 || amount === 0n || !canonicalField(nullifier) || same(nullifier, new Uint8Array(32)))
             throw new Error("Malformed unshield event fields");
         return { kind: "unshield", pool, asset, amount, recipient, nullifier: Uint8Array.from(nullifier), generation, rootSequence, slot, signature };
+    }
+    if (data.subarray(0, 8).equals(ROLLOVER)) {
+        if (data.length !== 152)
+            throw new Error("Malformed rollover event length");
+        return { kind: "rollover", pool: pubkey(data, 8), previousTree: pubkey(data, 40), previousGeneration: u64(data, 72),
+            previousFinalRoot: cloneBytes(data.subarray(80, 112)), newTree: pubkey(data, 112), newGeneration: u64(data, 144), slot, signature };
     }
     return undefined;
 }
@@ -667,19 +686,101 @@ async function retryTransaction(connection, signature) {
         throw error;
     }
 }
+function poolInitial(identity, current) {
+    const generationZero = cloneInitialTree(current.pool, { ...current, generation: 0n });
+    return { generations: new Map([[0n, { identity: { ...identity, generation: 0n }, tree: generationZero, appends: new Map(), spentNullifiers: new Set() }]]),
+        activeGeneration: 0n, events: [], spentNullifiers: new Set() };
+}
+function applyPoolEvent(state, pool, program, event) {
+    assertIdentity(pool, event);
+    if (event.kind === "rollover") {
+        const previous = state.generations.get(state.activeGeneration);
+        if (event.previousGeneration !== state.activeGeneration || event.newGeneration !== event.previousGeneration + 1n || event.newGeneration > 0xffffffffffffffffn)
+            reconstruction("GENERATION_MISMATCH", "Impossible rollover generation continuity");
+        if (!event.previousTree.equals(pda.tree(pool, event.previousGeneration, program)[0]) || !event.newTree.equals(pda.tree(pool, event.newGeneration, program)[0]))
+            reconstruction("GENERATION_MISMATCH", "Rollover PDA/generation mismatch");
+        if (TREE_CAPACITY - previous.tree.nextIndex > 1n || !same(rootFromTree(previous.tree), event.previousFinalRoot))
+            reconstruction("ROOT_MISMATCH", "Rollover final root or remaining capacity mismatch");
+        const tree = cloneInitialTree(pool, { ...previous.tree, generation: event.newGeneration });
+        state.generations.set(event.newGeneration, { identity: { ...previous.identity, tree: event.newTree.toBase58(), generation: event.newGeneration }, tree, appends: new Map(), spentNullifiers: new Set() });
+        state.activeGeneration = event.newGeneration;
+    }
+    else {
+        const input = state.generations.get(event.generation);
+        if (!input)
+            reconstruction("GENERATION_MISMATCH", "Input generation has not been initialized by rollover");
+        if (event.kind === "shield") {
+            if (event.generation !== state.activeGeneration)
+                reconstruction("GENERATION_MISMATCH", "Shield appended into a historical generation");
+            applyEvent(input, pool, event);
+        }
+        else {
+            if (event.kind === "unshield" && (event.amount <= 0n || event.asset > 1))
+                reconstruction("HISTORY_GAP", "Invalid unshield fields");
+            if (!canonicalField(event.nullifier) || same(event.nullifier, new Uint8Array(32)))
+                reconstruction("HISTORY_GAP", "Invalid nullifier in history");
+            const nf = hex(event.nullifier);
+            if (state.spentNullifiers.has(nf))
+                reconstruction("DUPLICATE_EVENT", "Duplicate pool-global nullifier in history");
+            if (event.kind === "unshield")
+                assertAcceptedRoot(input.tree, event.rootSequence);
+            else {
+                assertAcceptedRoot(input.tree, event.rootSequence, event.root);
+                if (event.outputGeneration !== state.activeGeneration)
+                    reconstruction("GENERATION_MISMATCH", "Swap output generation is not active");
+                const output = state.generations.get(event.outputGeneration);
+                const next = output.tree.nextIndex;
+                if (event.changeIndex !== undefined && event.changeIndex !== next || event.outputIndex !== next + (event.changeIndex === undefined ? 0n : 1n))
+                    reconstruction("SEQUENCE_GAP", "Cross-generation swap output indices are not contiguous");
+                if (event.changeIndex !== undefined)
+                    appendRecord(output, appendLeaf(output.tree, event.changeCommitment), event.changeCommitment, event);
+                appendRecord(output, appendLeaf(output.tree, event.outputCommitment), event.outputCommitment, event);
+            }
+            state.spentNullifiers.add(nf);
+        }
+    }
+    state.events.push(event);
+}
+function serializeHistory(event) {
+    if (event.kind === "shield" || event.kind === "swap")
+        return serializeEvent(event);
+    if (event.kind === "unshield")
+        return { ...event, pool: event.pool.toBase58(), amount: event.amount.toString(), recipient: event.recipient.toBase58(), nullifier: hex(event.nullifier), generation: event.generation.toString(), rootSequence: event.rootSequence.toString() };
+    return { ...event, pool: event.pool.toBase58(), previousTree: event.previousTree.toBase58(), previousGeneration: event.previousGeneration.toString(), previousFinalRoot: hex(event.previousFinalRoot), newTree: event.newTree.toBase58(), newGeneration: event.newGeneration.toString() };
+}
+function deserializeHistory(value) {
+    if (!value || typeof value !== "object")
+        reconstruction("INVALID_CHECKPOINT", "Invalid pool event");
+    const e = value;
+    if (e.kind === "shield" || e.kind === "swap")
+        return deserializeEvent(e);
+    const common = { pool: parsePublicKey(e.pool, "pool"), signature: typeof e.signature === "string" && e.signature.length ? e.signature : reconstruction("INVALID_CHECKPOINT", "Invalid event signature"), slot: parseSafeInteger(e.slot, "slot") };
+    if (e.kind === "unshield")
+        return { ...common, kind: "unshield", asset: parseSafeInteger(e.asset, "asset"), amount: parseBigInt(e.amount, "amount"), recipient: parsePublicKey(e.recipient, "recipient"), nullifier: parseBytes(e.nullifier, 32, "nullifier"), generation: parseBigInt(e.generation, "generation"), rootSequence: parseBigInt(e.rootSequence, "sequence") };
+    if (e.kind === "rollover")
+        return { ...common, kind: "rollover", previousTree: parsePublicKey(e.previousTree, "previous tree"), previousGeneration: parseBigInt(e.previousGeneration, "previous generation"), previousFinalRoot: parseBytes(e.previousFinalRoot, 32, "final root"), newTree: parsePublicKey(e.newTree, "new tree"), newGeneration: parseBigInt(e.newGeneration, "new generation") };
+    reconstruction("INVALID_CHECKPOINT", "Unknown pool event");
+}
+function serializePoolCheckpoint(state, identity) {
+    const base = { formatVersion: 2, identity, events: state.events.map(serializeHistory), cursor: { lastProcessedSignature: state.lastProcessedSignature, lastFinalizedSlot: state.lastFinalizedSlot },
+        trees: [...state.generations.values()].map(s => serializeTree(s.tree)) };
+    return Buffer.from(JSON.stringify({ ...base, integrity: { algorithm: "sha256", digest: createHash("sha256").update(JSON.stringify(base)).digest("hex") } }));
+}
 export class RpcMerkleWitnessProvider {
     connection;
     programId;
     getTree;
     checkpointStore;
+    getGenerationTree;
     states = new Map();
     syncing = new Map();
     genesisHash;
-    constructor(connection, programId, getTree, checkpointStore) {
+    constructor(connection, programId, getTree, checkpointStore, getGenerationTree) {
         this.connection = connection;
         this.programId = programId;
         this.getTree = getTree;
         this.checkpointStore = checkpointStore;
+        this.getGenerationTree = getGenerationTree;
     }
     async getGenesisIdentity() {
         if (this.genesisHash)
@@ -757,63 +858,180 @@ export class RpcMerkleWitnessProvider {
             reconstruction("HISTORY_GAP", `Transaction has an invalid slot: ${row.signature}`);
         if (transaction.slot !== row.slot)
             reconstruction("HISTORY_GAP", `Transaction slot disagrees with signature history: ${row.signature}`);
-        if (!transaction.meta || transaction.meta.err !== null || row.err !== null && row.err !== undefined)
-            reconstruction("FAILED_TRANSACTION", `Finalized history transaction failed: ${row.signature}`);
+        if (!transaction.meta)
+            reconstruction("HISTORY_GAP", `Finalized transaction metadata is missing: ${row.signature}`);
+        if ((transaction.meta.err !== null) !== (row.err !== null && row.err !== undefined))
+            reconstruction("FAILED_TRANSACTION", `RPC failure status disagrees with finalized transaction: ${row.signature}`);
         if (!Array.isArray(transaction.transaction.signatures) || transaction.transaction.signatures[0] !== row.signature)
             reconstruction("HISTORY_GAP", `Transaction signature does not match finalized history: ${row.signature}`);
         return transaction;
     }
+    async historicalTree(pool, generation) {
+        if (this.getGenerationTree) {
+            const tree = await this.getGenerationTree(pool, generation);
+            if (!tree.pool.equals(pool) || tree.generation !== generation)
+                reconstruction("INVALID_TREE", "Historical tree identity mismatch");
+            return tree;
+        }
+        const address = pda.tree(pool, generation, this.programId)[0];
+        const info = await retryRpc("historical TreeState", () => this.connection.getAccountInfo(address, "finalized"));
+        if (!info || !info.owner.equals(this.programId) || !info.data.subarray(0, 8).equals(accountDiscriminator("TreeState")))
+            reconstruction("INVALID_TREE", "Historical tree missing or has wrong owner/discriminator");
+        const tree = decodeTreeState(info.data.subarray(8));
+        if (!tree.pool.equals(pool) || tree.generation !== generation)
+            reconstruction("INVALID_TREE", "Historical tree PDA/generation mismatch");
+        return tree;
+    }
+    async poolCheckpointBytes(identity) {
+        const data = await this.checkpointStore?.loadMerkleCheckpoint(identity);
+        if (!data)
+            return undefined;
+        let manifest;
+        try {
+            manifest = JSON.parse(Buffer.from(data).toString("utf8"));
+        }
+        catch {
+            reconstruction("INVALID_CHECKPOINT", "Invalid checkpoint JSON");
+        }
+        if (manifest.chunked !== true)
+            return data;
+        if (manifest.formatVersion !== 2 || manifest.identity !== identity || !Array.isArray(manifest.chunks) || typeof manifest.digest !== "string")
+            reconstruction("INVALID_CHECKPOINT", "Invalid chunked checkpoint manifest");
+        const chunks = [];
+        for (const value of manifest.chunks) {
+            if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value))
+                reconstruction("INVALID_CHECKPOINT", "Invalid checkpoint chunk digest");
+            const key = JSON.stringify({ poolCheckpoint: identity, sha256: value });
+            const chunk = await this.checkpointStore.loadMerkleCheckpoint(key);
+            if (!chunk || chunk.length > 8 * 1024 * 1024 || createHash("sha256").update(chunk).digest("hex") !== value)
+                reconstruction("INVALID_CHECKPOINT", "Missing or unauthenticated checkpoint chunk");
+            chunks.push(Buffer.from(chunk));
+        }
+        const result = Buffer.concat(chunks);
+        if (manifest.byteLength !== result.length || createHash("sha256").update(result).digest("hex") !== manifest.digest)
+            reconstruction("INVALID_CHECKPOINT", "Chunked checkpoint integrity mismatch");
+        return result;
+    }
+    async savePoolCheckpoint(identity, data) {
+        const store = this.checkpointStore;
+        // Per-store checkpoints are bounded (the encrypted journal uses 64 MiB).
+        // Content-addressed chunks are written before the atomic manifest switch.
+        // Old manifests remain readable if the process stops partway through a save.
+        const chunkSize = 8 * 1024 * 1024;
+        if (data.length <= chunkSize) {
+            await store.saveMerkleCheckpoint(identity, data);
+            return;
+        }
+        const digests = [];
+        for (let offset = 0; offset < data.length; offset += chunkSize) {
+            const chunk = data.subarray(offset, offset + chunkSize);
+            const digest = createHash("sha256").update(chunk).digest("hex");
+            digests.push(digest);
+            await store.saveMerkleCheckpoint(JSON.stringify({ poolCheckpoint: identity, sha256: digest }), chunk);
+        }
+        await store.saveMerkleCheckpoint(identity, Buffer.from(JSON.stringify({ formatVersion: 2, identity, chunked: true, byteLength: data.length,
+            digest: createHash("sha256").update(data).digest("hex"), chunks: digests })));
+    }
     async syncPool(pool) {
-        const poolKey = pool.toBase58();
         const current = await this.getTree(pool);
         validateTreeShape(current, "finalized tree");
         if (!current.pool.equals(pool))
             reconstruction("INVALID_TREE", "Finalized tree belongs to another pool");
-        const identity = await this.identity(pool, current);
-        const stateKey = identityKey(identity);
+        const legacyIdentity = await this.identity(pool, { ...current, generation: 0n });
+        const identity = { genesisHash: legacyIdentity.genesisHash, programId: this.programId.toBase58(), pool: pool.toBase58(), stream: pda.shielded(pool, this.programId)[0].toBase58(), format: "pool-generations-v2" };
+        const stateKey = JSON.stringify(identity);
         let state = this.states.get(stateKey);
-        if (!state)
-            state = await this.loadCheckpoint(identity, pool);
-        if (state) {
-            if (state.identity.generation !== current.generation)
-                reconstruction("GENERATION_MISMATCH", "Checkpoint generation differs from finalized tree");
-            if (!state.tree.emptySubtrees.every((value, index) => same(value, current.emptySubtrees[index])))
-                reconstruction("ROOT_MISMATCH", "Checkpoint empty subtrees differ from finalized tree");
-            if (state.tree.nextIndex > current.nextIndex)
-                reconstruction("SEQUENCE_GAP", "Checkpoint is ahead of finalized tree");
-            if (state.tree.nextIndex === current.nextIndex) {
-                const stateRoot = rootFromTree(state.tree);
-                if (!same(stateRoot, rootFromTree(current)))
-                    reconstruction("ROOT_MISMATCH", "Checkpoint root differs from finalized tree");
-            }
-            state = cloneState(state);
-        }
+        if (state)
+            state = { ...state, generations: new Map([...state.generations].map(([g, s]) => [g, cloneState(s)])), events: [...state.events], spentNullifiers: new Set(state.spentNullifiers) };
         else {
-            state = { identity, tree: cloneInitialTree(pool, current), appends: new Map(), spentNullifiers: new Set() };
-        }
-        const [treeAddress] = PublicKey.findProgramAddressSync([Buffer.from("tree"), pool.toBuffer()], this.programId);
-        const rows = await this.collectRows(treeAddress, state.lastProcessedSignature);
-        for (const row of rows) {
-            state.lastProcessedSignature = row.signature;
-            state.lastFinalizedSlot = row.slot;
-            const transaction = await this.transaction(row);
-            if (!messageHasProgramInstruction(transaction, this.programId, treeAddress))
-                continue;
-            for (const data of programEventLogs(transaction, this.programId)) {
-                let event;
+            state = poolInitial(legacyIdentity, current);
+            let data;
+            try {
+                data = await this.poolCheckpointBytes(stateKey);
+            }
+            catch {
+                reconstruction("INVALID_CHECKPOINT", "Unable to authenticate pool checkpoint");
+            }
+            if (data) {
+                let payload;
                 try {
-                    event = parseEvent(data, row.signature, row.slot);
+                    payload = JSON.parse(Buffer.from(data).toString("utf8"));
+                }
+                catch {
+                    reconstruction("INVALID_CHECKPOINT", "Invalid checkpoint JSON");
+                }
+                const integrity = payload.integrity;
+                const base = { ...payload };
+                delete base.integrity;
+                if (payload.formatVersion !== 2 || JSON.stringify(payload.identity) !== stateKey || integrity?.algorithm !== "sha256" || integrity.digest !== createHash("sha256").update(JSON.stringify(base)).digest("hex"))
+                    reconstruction("INVALID_CHECKPOINT", "Pool checkpoint identity/version/integrity mismatch");
+                if (!Array.isArray(payload.events) || !Array.isArray(payload.trees))
+                    reconstruction("INVALID_CHECKPOINT", "Invalid pool checkpoint content");
+                try {
+                    let previousSlot = -1;
+                    for (const value of payload.events) {
+                        const event = deserializeHistory(value);
+                        if (event.slot < previousSlot)
+                            reconstruction("INVALID_CHECKPOINT", "Checkpoint event order mismatch");
+                        previousSlot = event.slot;
+                        applyPoolEvent(state, pool, this.programId, event);
+                    }
+                    if (payload.trees.length !== state.generations.size)
+                        reconstruction("INVALID_CHECKPOINT", "Checkpoint generations mismatch");
+                    for (const value of payload.trees) {
+                        const tree = deserializeTree(value);
+                        const replay = state.generations.get(tree.generation);
+                        if (!replay)
+                            reconstruction("INVALID_CHECKPOINT", "Checkpoint unknown generation");
+                        compareTreeState(replay.tree, tree);
+                    }
                 }
                 catch (error) {
-                    reconstruction("HISTORY_GAP", `Malformed finalized event in ${row.signature}: ${String(error)}`);
+                    reconstruction("INVALID_CHECKPOINT", `Pool checkpoint replay failed: ${String(error)}`);
                 }
-                if (event)
-                    applyEvent(state, pool, event);
+                const cursor = payload.cursor;
+                if ((cursor?.lastProcessedSignature === undefined) !== (cursor?.lastFinalizedSlot === undefined))
+                    reconstruction("INVALID_CHECKPOINT", "Checkpoint cursor incomplete");
+                if (cursor?.lastProcessedSignature !== undefined) {
+                    if (typeof cursor.lastProcessedSignature !== "string")
+                        reconstruction("INVALID_CHECKPOINT", "Invalid cursor signature");
+                    state.lastProcessedSignature = cursor.lastProcessedSignature;
+                    state.lastFinalizedSlot = parseSafeInteger(cursor.lastFinalizedSlot, "cursor slot");
+                }
+            }
+            else {
+                // Authenticate and validate v1 before discarding its tree-specific cursor.
+                // Rebuild the pool-global stream; never reinterpret old checkpoint bytes.
+                await this.loadCheckpoint(legacyIdentity, pool);
             }
         }
-        compareTreeState(state.tree, current);
-        if (this.checkpointStore && (rows.length > 0 || !this.states.has(stateKey)))
-            await this.checkpointStore.saveMerkleCheckpoint(stateKey, serializeCheckpoint(state));
+        const historyAddress = pda.shielded(pool, this.programId)[0];
+        const rows = await this.collectRows(historyAddress, state.lastProcessedSignature);
+        for (const row of rows) {
+            const transaction = await this.transaction(row);
+            if (transaction.meta.err === null && messageHasProgramInstruction(transaction, this.programId, historyAddress)) {
+                for (const data of programEventLogs(transaction, this.programId)) {
+                    let event;
+                    try {
+                        event = parseShieldedEvent(data, row.signature, row.slot);
+                    }
+                    catch (error) {
+                        reconstruction("HISTORY_GAP", `Malformed finalized event in ${row.signature}: ${String(error)}`);
+                    }
+                    if (event)
+                        applyPoolEvent(state, pool, this.programId, event);
+                }
+            }
+            state.lastProcessedSignature = row.signature;
+            state.lastFinalizedSlot = row.slot;
+        }
+        if (state.activeGeneration !== current.generation)
+            reconstruction("GENERATION_MISMATCH", "History is missing a rollover or active tree changed during sync; retry");
+        for (const [g, s] of state.generations) {
+            compareTreeState(s.tree, g === current.generation ? current : await this.historicalTree(pool, g));
+        }
+        if (this.checkpointStore && (rows.length || !this.states.has(stateKey)))
+            await this.savePoolCheckpoint(stateKey, serializePoolCheckpoint(state, identity));
         this.states.set(stateKey, state);
         return state;
     }
@@ -833,19 +1051,20 @@ export class RpcMerkleWitnessProvider {
     }
     async getShieldEvents(pool) {
         const state = await this.load(pool);
-        return [...state.appends.values()].filter(record => record.event.kind === "shield").sort((a, b) => Number(a.index - b.index)).map(record => cloneEvent(record.event));
+        return [...state.generations.values()].flatMap(s => [...s.appends.values()]).filter(record => record.event.kind === "shield").map(record => cloneEvent(record.event));
     }
     async getSpentNullifiers(pool) {
         const state = await this.load(pool);
         return [...state.spentNullifiers].map(bytes);
     }
-    async getWitness(pool, commitment) {
-        const state = await this.load(pool);
-        const current = await this.getTree(pool);
-        compareTreeState(state.tree, current);
-        const leaf = [...state.appends.values()].find(record => same(record.commitment, commitment));
+    async getWitness(pool, commitment, generation) {
+        const replay = await this.load(pool);
+        const matches = [...replay.generations.values()].filter(state => generation === undefined || state.tree.generation === generation).flatMap(state => [...state.appends.values()].filter(record => same(record.commitment, commitment)).map(leaf => ({ state, leaf })));
+        const state = matches[0]?.state;
+        const leaf = matches[0]?.leaf;
         if (!leaf)
             throw new Error("Note commitment is not present in the reconstructed tree");
+        const current = state.tree;
         let levelNodes = new Map([...state.appends.values()].map(record => [record.index, record.commitment]));
         const siblings = [];
         let nodeIndex = leaf.index;

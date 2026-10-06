@@ -1,19 +1,19 @@
 import { ComputeBudgetProgram, PublicKey } from "@solana/web3.js";
-import { createAssociatedTokenAccountIdempotentInstruction, getAssociatedTokenAddressSync, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import { createAssociatedTokenAccountIdempotentInstruction, getAccount, getAssociatedTokenAddressSync, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { cryptoRandom, decryptNotePayload, encryptNote, encodeNote, keyHierarchy, noteCommitment, nullifier, ownerCommitment } from "./crypto.js";
 import { accountDiscriminator } from "./encoding.js";
 import { privateSwap as privateSwapIx, shield as shieldIx, unshield as unshieldIx } from "./instructions.js";
 import { encodePrivateSwapPublicInputs, encodeUnshieldPublicInputs } from "./prover.js";
-import { swapOutputPreservingLpClaims } from "./math.js";
+import { shieldFee, swapOutputPreservingLpClaims } from "./math.js";
 import { pda } from "./pda.js";
 import type { JournaledNoteStore, MerkleWitnessProvider, Note, NoteStore, OperationRecord, Prover, ShieldParams } from "./types.js";
 import { transactionSignatureFromBytes, type Lethenymous } from "./client.js";
 
 const key = (value: Uint8Array) => Buffer.from(value).toString("hex");
-const clone = (note: Note): Note => ({ ...note, ownerCommitment: Uint8Array.from(note.ownerCommitment), randomness: Uint8Array.from(note.randomness), commitment: Uint8Array.from(note.commitment), encryptedPayload: note.encryptedPayload && Uint8Array.from(note.encryptedPayload), operationId: note.operationId && Uint8Array.from(note.operationId) });
+const clone = (note: Note): Note => ({ ...note, generation: note.generation ?? 0n, ownerCommitment: Uint8Array.from(note.ownerCommitment), randomness: Uint8Array.from(note.randomness), commitment: Uint8Array.from(note.commitment), encryptedPayload: note.encryptedPayload && Uint8Array.from(note.encryptedPayload), operationId: note.operationId && Uint8Array.from(note.operationId) });
 const state = (note: Note) => note.state ?? (note.spent ? "spent" : "available");
 const same = (a: Uint8Array, b: Uint8Array) => Buffer.from(a).equals(Buffer.from(b));
-const noteFingerprint = (note: Note) => JSON.stringify({ pool: note.pool.toBase58(), asset: note.asset.toBase58(), amount: note.amount.toString(), ownerCommitment: key(note.ownerCommitment), randomness: key(note.randomness), commitment: key(note.commitment), encryptedPayload: note.encryptedPayload && key(note.encryptedPayload), leafIndex: note.leafIndex?.toString(), state: state(note), operationId: note.operationId && key(note.operationId), transactionSignature: note.transactionSignature });
+const noteFingerprint = (note: Note) => JSON.stringify({ pool: note.pool.toBase58(), asset: note.asset.toBase58(), amount: note.amount.toString(), generation: (note.generation ?? 0n).toString(), ownerCommitment: key(note.ownerCommitment), randomness: key(note.randomness), commitment: key(note.commitment), encryptedPayload: note.encryptedPayload && key(note.encryptedPayload), leafIndex: note.leafIndex?.toString(), state: state(note), operationId: note.operationId && key(note.operationId), transactionSignature: note.transactionSignature });
 
 export class InMemoryNoteStore implements JournaledNoteStore {
   private readonly notes = new Map<string, Note>();
@@ -182,17 +182,23 @@ export class ShieldedWallet {
 
   async shield(input: ShieldParams): Promise<{ signature: string; note: Note }> {
     const pool = await this.sdk.getPool(input.pool);
-    const stateAccount = await this.sdk.getShieldedState(input.pool);
+    const active = await this.sdk.ensureTreeCapacity(input.pool, 1);
+    const stateAccount = active.state;
+    const fee = shieldFee(input.amount);
+    const totalDebit = input.amount + fee;
+    if (totalDebit > 0xffffffffffffffffn) throw new Error("Shield amount plus fee exceeds u64");
     const asset = input.mint.equals(pool.tokenAMint) ? 0 : input.mint.equals(pool.tokenBMint) ? 1 : -1;
     if (asset < 0) throw new Error("Mint is not a pool asset");
     const randomness = cryptoRandom(32);
     const commitment = noteCommitment(input.pool, input.mint, input.amount, this.ownerCommitment, randomness);
     const encrypted = encryptNote(encodeNote(input.pool, input.mint, input.amount, this.ownerCommitment, randomness), this.viewKey, input.pool, input.mint, commitment);
-    const note: Note = { pool: input.pool, asset: input.mint, amount: input.amount, ownerCommitment: this.ownerCommitment, randomness, commitment, encryptedPayload: encrypted, state: "available" };
+    const note: Note = { pool: input.pool, asset: input.mint, amount: input.amount, generation: active.tree.generation, ownerCommitment: this.ownerCommitment, randomness, commitment, encryptedPayload: encrypted, state: "available" };
     const operationId = cryptoRandom(32);
     await this.begin({ id: operationId, kind: "shield", state: "intent", pool: input.pool, metadata: { asset: input.mint.toBase58(), amount: input.amount.toString(), commitment: key(commitment) }, outputNotes: [note] });
     try {
       const [depositorA, depositorB] = await this.sdk.ensureAtas([{ mint: pool.tokenAMint, owner: this.sdk.wallet.publicKey }, { mint: pool.tokenBMint, owner: this.sdk.wallet.publicKey }]);
+      const balance = await getAccount(this.sdk.connection, asset === 0 ? depositorA : depositorB, "finalized", TOKEN_PROGRAM_ID);
+      if (balance.amount < totalDebit) throw new Error("Insufficient depositor balance for shield amount plus fee");
       const outcome = await this.sdk.buildAndSendOutcome([
         shieldIx(this.sdk.wallet.publicKey, pool, stateAccount, asset, input.amount, this.ownerCommitment, randomness, encrypted, depositorA, depositorB, this.sdk.programId),
       ], {
@@ -222,7 +228,8 @@ export class ShieldedWallet {
       reserved = true;
       const pool = await this.sdk.getPool(input.pool);
       const stateAccount = await this.sdk.getShieldedState(input.pool);
-      const witnessValue = await witness.getWitness(input.pool, note.commitment);
+      const witnessValue = await witness.getWitness(input.pool, note.commitment, note.generation ?? 0n);
+      if (witnessValue.generation !== (note.generation ?? 0n)) throw new Error("Note generation disagrees with reconstructed witness");
       const nullifierValue = nullifier(input.pool, input.mint, this.spendSecret, note.randomness);
       const preflightRecipientA = getAssociatedTokenAddressSync(pool.tokenAMint, input.recipient, true, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
       const preflightRecipientB = getAssociatedTokenAddressSync(pool.tokenBMint, input.recipient, true, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
@@ -270,7 +277,8 @@ export class ShieldedWallet {
       journaled = true;
       reserved = true;
       const pool = await this.sdk.getPool(input.pool);
-      const stateAccount = await this.sdk.getShieldedState(input.pool);
+      const active = await this.sdk.ensureTreeCapacity(input.pool, note.amount > input.amountIn ? 2 : 1);
+      let stateAccount = active.state;
       const direction = input.inputMint.equals(pool.tokenAMint) && input.outputMint.equals(pool.tokenBMint) ? 0 : input.inputMint.equals(pool.tokenBMint) && input.outputMint.equals(pool.tokenAMint) ? 1 : -1;
       if (direction < 0) throw new Error("Input and output mints must be the pool assets");
       const [reserves, lpSupply] = await Promise.all([this.sdk.getReserves(pool), this.sdk.getLpSupply(pool)]);
@@ -278,7 +286,8 @@ export class ShieldedWallet {
       const reserveOut = direction === 0 ? reserves.b : reserves.a;
       const amountOut = swapOutputPreservingLpClaims(reserveIn, reserveOut, input.amountIn, pool.feeBps, lpSupply);
       if (amountOut < input.minAmountOut) throw new Error("Slippage exceeded");
-      const witnessValue = await witness.getWitness(input.pool, note.commitment);
+      const witnessValue = await witness.getWitness(input.pool, note.commitment, note.generation ?? 0n);
+      if (witnessValue.generation !== (note.generation ?? 0n)) throw new Error("Note generation disagrees with reconstructed witness");
       const nullifierValue = nullifier(input.pool, input.inputMint, this.spendSecret, note.randomness);
       const changeAmount = note.amount - input.amountIn;
       const changeRandomness = changeAmount > 0n ? cryptoRandom(32) : new Uint8Array(32);
@@ -287,6 +296,8 @@ export class ShieldedWallet {
       const outputCommitment = noteCommitment(input.pool, input.outputMint, amountOut, this.ownerCommitment, outputRandomness);
       const changeNote = changeAmount > 0n ? this.localNote(input.pool, input.inputMint, changeAmount, changeRandomness, changeCommitment) : undefined;
       const outputNote = this.localNote(input.pool, input.outputMint, amountOut, outputRandomness, outputCommitment);
+      if (changeNote) changeNote.generation = active.tree.generation;
+      outputNote.generation = active.tree.generation;
       await this.sdk.validatePrivateTransactionReady([
         ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }),
         privateSwapIx(this.sdk.wallet.publicKey, pool, stateAccount, direction, witnessValue.root, witnessValue.rootSequence, witnessValue.generation, nullifierValue, input.amountIn, amountOut, changeAmount, changeCommitment, outputCommitment, new Uint8Array(256), this.sdk.programId),
@@ -297,6 +308,13 @@ export class ShieldedWallet {
       const result = await prover.provePrivateSwap(proofInput);
       const expected = encodePrivateSwapPublicInputs(proofInput);
       if (!Buffer.from(result.publicInputs).equals(Buffer.from(expected))) throw new Error("Prover returned mismatched private-swap public inputs");
+      // Output generation is not proof-bound. Re-read capacity after proving;
+      // a concurrent rollover can safely redirect both outputs together.
+      const currentOutput = await this.sdk.ensureTreeCapacity(input.pool, changeAmount > 0n ? 2 : 1);
+      stateAccount = currentOutput.state;
+      if (changeNote) changeNote.generation = currentOutput.tree.generation;
+      outputNote.generation = currentOutput.tree.generation;
+      if (journal) await journal.updateOperation(operationId, { outputNotes: [...(changeNote ? [changeNote] : []), outputNote] });
       const outcome = await this.sdk.buildAndSendOutcome([
         ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }),
         privateSwapIx(this.sdk.wallet.publicKey, pool, stateAccount, direction, witnessValue.root, witnessValue.rootSequence, witnessValue.generation, nullifierValue, input.amountIn, amountOut, changeAmount, changeCommitment, outputCommitment, result.proof, this.sdk.programId),
@@ -319,7 +337,7 @@ export class ShieldedWallet {
   }
 
   async recoverShieldedNotes(pool: PublicKey): Promise<Note[]> {
-    const provider = this.witnessProvider as (MerkleWitnessProvider & { getShieldEvents?: (pool: PublicKey) => Promise<Array<{ asset: number; amount: bigint; commitment: Uint8Array; encryptedNote: Uint8Array; index: bigint; pool: PublicKey }>>; getSpentNullifiers?: (pool: PublicKey) => Promise<Uint8Array[]> }) | undefined;
+    const provider = this.witnessProvider as (MerkleWitnessProvider & { getShieldEvents?: (pool: PublicKey) => Promise<Array<{ asset: number; amount: bigint; commitment: Uint8Array; encryptedNote: Uint8Array; index: bigint; generation?: bigint; pool: PublicKey }>>; getSpentNullifiers?: (pool: PublicKey) => Promise<Uint8Array[]> }) | undefined;
     if (!provider?.getShieldEvents || !provider.getSpentNullifiers) throw new Error("The configured witness provider does not support authenticated shield recovery");
     const stateAccount = await this.sdk.getShieldedState(pool);
     const spentNullifiers = new Set((await provider.getSpentNullifiers(pool)).map(value => key(value)));
@@ -359,7 +377,7 @@ export class ShieldedWallet {
     for (const candidate of decoded) {
       const { event, mint } = candidate;
       const consumed = spentNullifiers.has(key(candidate.nullifier));
-      const note: Note = { pool, asset: mint, amount: candidate.amount, ownerCommitment: candidate.ownerCommitment, randomness: candidate.randomness, commitment: event.commitment, encryptedPayload: event.encryptedNote, leafIndex: event.index, state: consumed ? "spent" : "available" };
+      const note: Note = { pool, asset: mint, amount: candidate.amount, generation: event.generation ?? 0n, ownerCommitment: candidate.ownerCommitment, randomness: candidate.randomness, commitment: event.commitment, encryptedPayload: event.encryptedNote, leafIndex: event.index, state: consumed ? "spent" : "available" };
       const current = existing.get(key(note.commitment));
       if (!current) await this.store.saveNote(note);
       else if (consumed && state(current) !== "spent") {

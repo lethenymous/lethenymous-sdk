@@ -1,5 +1,5 @@
 import { PublicKey } from "@solana/web3.js";
-import { PROGRAM_ID } from "./encoding.js";
+import { PROGRAM_ID, u64 } from "./encoding.js";
 export const pda = {
     pool: (a, b, feeBps, programId = PROGRAM_ID) => PublicKey.findProgramAddressSync([Buffer.from("pool"), a.toBuffer(), b.toBuffer(), u16le(feeBps)], programId),
     vaultA: (pool, programId = PROGRAM_ID) => find("vault-a", pool, programId),
@@ -11,7 +11,13 @@ export const pda = {
     lpMint: (pool, programId = PROGRAM_ID) => find("lp", pool, programId),
     lpLock: (pool, programId = PROGRAM_ID) => find("lp-lock", pool, programId),
     shielded: (pool, programId = PROGRAM_ID) => find("shielded", pool, programId),
-    tree: (pool, programId = PROGRAM_ID) => find("tree", pool, programId),
+    tree: (pool, generationOrProgram = 0n, programId = PROGRAM_ID) => {
+        const generation = generationOrProgram instanceof PublicKey ? 0n : generationOrProgram;
+        const program = generationOrProgram instanceof PublicKey ? generationOrProgram : programId;
+        if (generation === 0n)
+            return find("tree", pool, program);
+        return PublicKey.findProgramAddressSync([Buffer.from("tree"), pool.toBuffer(), u64(generation)], program);
+    },
     custodyA: (pool, programId = PROGRAM_ID) => find("custody-a", pool, programId),
     custodyB: (pool, programId = PROGRAM_ID) => find("custody-b", pool, programId),
     spent: (pool, nullifier, programId = PROGRAM_ID) => PublicKey.findProgramAddressSync([Buffer.from("spent"), pool.toBuffer(), Buffer.from(nullifier)], programId),

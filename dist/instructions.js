@@ -5,13 +5,18 @@ const meta = (pubkey, isSigner = false, isWritable = false) => ({ pubkey, isSign
 const ro = (key) => meta(key);
 const rw = (key) => meta(key, false, true);
 const signer = (key) => meta(key, true, true);
+function archiveContext(pool, state, context, programId) {
+    if (!context || context.nextIndex < 0n || context.nextIndex >= 65536n || !state.tree.equals(pda.tree(pool.address, context.generation, programId)[0]))
+        throw new Error("Validated active archive append context is required");
+    return context;
+}
 function ix(name, args, accounts, programId) {
     return new TransactionInstruction({ programId, keys: accounts, data: concat(discriminator(name), args) });
 }
 export function rolloverTree(payer, pool, currentGeneration, programId = PROGRAM_ID) {
     return ix("rollover_tree", u64(currentGeneration + 1n), [
         signer(payer), ro(pool), rw(pda.shielded(pool, programId)[0]), ro(pda.tree(pool, currentGeneration, programId)[0]),
-        rw(pda.tree(pool, currentGeneration + 1n, programId)[0]), ro(SystemProgram.programId),
+        rw(pda.tree(pool, currentGeneration + 1n, programId)[0]), rw(pda.pageDirectory(pool, currentGeneration + 1n, programId)[0]), ro(SystemProgram.programId),
     ], programId);
 }
 export function initializePool(payer, authority, creator, a, b, feeBps, programId = PROGRAM_ID) {
@@ -32,6 +37,7 @@ export function initializeShieldedState(payer, pool, state, programId = PROGRAM_
     return ix("initialize_shielded_state", Buffer.alloc(0), [
         signer(payer), ro(pool), ro(s.tokenAMint), ro(s.tokenBMint),
         rw(pda.shielded(pool, programId)[0]), rw(pda.tree(pool, programId)[0]),
+        rw(pda.pageDirectory(pool, 0n, programId)[0]),
         rw(pda.custodyA(pool, programId)[0]), rw(pda.custodyB(pool, programId)[0]),
         ro(TOKEN_PROGRAM_ID), ro(SystemProgram.programId), ro(SYSVAR_RENT_PUBKEY),
     ], programId);
@@ -43,11 +49,13 @@ export function addLiquidity(provider, pool, providerA, providerB, providerLp, a
         rw(providerA), rw(providerB), rw(providerLp), ro(TOKEN_PROGRAM_ID),
     ], programId);
 }
-export function shield(depositor, pool, state, asset, amount, owner, randomness, encrypted, depositorA, depositorB, programId = PROGRAM_ID) {
+export function shield(depositor, pool, state, asset, amount, owner, randomness, encrypted, depositorA, depositorB, programId = PROGRAM_ID, archive) {
+    const target = archiveContext(pool, state, archive, programId);
     return ix("shield", concat(enumByte(asset), u64(amount), bytes32(owner), bytes32(randomness), vec(encrypted)), [
         signer(depositor), ro(pool.address), rw(pda.shielded(pool.address, programId)[0]), rw(state.tree),
         ro(pool.tokenAMint), ro(pool.tokenBMint), rw(state.custodyA), rw(state.custodyB),
         rw(depositorA), rw(depositorB), rw(asset === 0 ? pool.protocolFeeVaultA : pool.protocolFeeVaultB), ro(TOKEN_PROGRAM_ID),
+        rw(pda.pageDirectory(pool.address, target.generation, programId)[0]), rw(pda.leafPage(pool.address, target.generation, Number(target.nextIndex >> 12n), programId)[0]), ro(SystemProgram.programId),
     ], programId);
 }
 export function removeLiquidity(provider, pool, providerA, providerB, providerLp, lpAmount, minA, minB, programId = PROGRAM_ID) {
@@ -73,12 +81,19 @@ export function unshield(payer, pool, state, asset, amount, root, rootSequence, 
         ro(TOKEN_PROGRAM_ID), ro(SystemProgram.programId),
     ], programId);
 }
-export function privateSwap(payer, pool, state, direction, root, rootSequence, generation, nullifierValue, amountIn, amountOut, changeAmount, changeCommitment, outputCommitment, proof, programId = PROGRAM_ID) {
+export function privateSwap(payer, pool, state, direction, root, rootSequence, generation, nullifierValue, amountIn, amountOut, changeAmount, changeCommitment, outputCommitment, proof, programId = PROGRAM_ID, archive) {
+    const target = archiveContext(pool, state, archive, programId);
+    const required = changeAmount > 0n ? 2n : 1n;
+    if (target.nextIndex + required > 65536n)
+        throw new Error("Active output archive needs rollover");
+    const firstPage = Number(target.nextIndex >> 12n), lastPage = Number((target.nextIndex + required - 1n) >> 12n);
     return ix("private_swap", concat(enumByte(direction), bytes32(root), u64(rootSequence), u64(generation), bytes32(nullifierValue), u64(amountIn), u64(amountOut), u64(changeAmount), bytes32(changeCommitment), bytes32(outputCommitment), vec(proof)), [
         signer(payer), rw(pool.address), rw(pda.shielded(pool.address, programId)[0]), ro(pda.tree(pool.address, generation, programId)[0]), rw(state.tree),
+        rw(pda.pageDirectory(pool.address, target.generation, programId)[0]), rw(pda.leafPage(pool.address, target.generation, firstPage, programId)[0]),
         rw(pool.tokenAMint), rw(pool.tokenBMint), ro(pool.lpMint), rw(pool.tokenAVault), rw(pool.tokenBVault),
         rw(pool.protocolFeeVaultA), rw(pool.protocolFeeVaultB), rw(pool.creatorFeeVaultA), rw(pool.creatorFeeVaultB),
         rw(state.custodyA), rw(state.custodyB), ro(TOKEN_PROGRAM_ID), ro(SystemProgram.programId),
         rw(pda.spent(pool.address, nullifierValue, programId)[0]),
+        ...(lastPage !== firstPage ? [rw(pda.leafPage(pool.address, target.generation, lastPage, programId)[0])] : []),
     ], programId);
 }

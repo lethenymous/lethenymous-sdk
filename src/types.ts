@@ -95,7 +95,7 @@ export interface MerkleWitness {
 }
 
 export interface MerkleWitnessProvider {
-  getWitness(pool: PublicKey, commitment: Uint8Array, generation?: bigint): Promise<MerkleWitness>;
+  getWitness(pool: PublicKey, commitment: Uint8Array, generation?: bigint, leafIndex?: bigint): Promise<MerkleWitness>;
 }
 
 /** Implementations must authenticate bytes and make replacements crash-safe.

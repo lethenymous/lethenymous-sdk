@@ -22,6 +22,8 @@ import { decodePool, decodeProtocolConfig, decodeShieldedState, decodeTreeState 
 import { pda } from "./pda.js";
 import { addLiquidity as addLiquidityIx, initializePool, initializeShieldedState, removeLiquidity as removeLiquidityIx, rolloverTree, swap as swapIx } from "./instructions.js";
 import { TREE_CAPACITY } from "./merkle.js";
+import { OnChainPagedMerkleWitnessProvider } from "./archive.js";
+import { authenticatedShieldedEvents, type HistoryEvent } from "./witness.js";
 import { swapOutputPreservingLpClaims } from "./math.js";
 import { keyHierarchy, ownerCommitment } from "./crypto.js";
 import { EncryptedFileNoteStore } from "./store.js";
@@ -106,7 +108,7 @@ export class Lethenymous {
     this.connection = config.connection;
     this.wallet = config.wallet;
     this.programId = config.programId ?? PROGRAM_ID;
-    this.witnessProvider = config.witnessProvider;
+    this.witnessProvider = config.witnessProvider ?? new OnChainPagedMerkleWitnessProvider(this.connection, this.programId);
     this.lookupTables = (config.lookupTables ?? []).map(value => value instanceof PublicKey ? { address: value } : value);
   }
 
@@ -310,6 +312,12 @@ export class Lethenymous {
       if (needles.every(needle => data.includes(Buffer.from(needle)))) return true;
     }
     return false;
+  }
+
+  async getFinalizedShieldedEvents(signature: string): Promise<HistoryEvent[]> {
+    const tx = await this.connection.getTransaction(signature, { commitment: "finalized", maxSupportedTransactionVersion: 0 });
+    if (!tx || tx.transaction.signatures[0] !== signature) throw new Error("Finalized transaction unavailable or signature mismatch");
+    return authenticatedShieldedEvents(tx, this.programId);
   }
 
   async buildAndSend(instructions: TransactionInstruction[], options: SendOptions = {}): Promise<string> {

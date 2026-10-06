@@ -44,6 +44,8 @@ export declare class ShieldedWallet {
     private unknown;
     private submitted;
     private finalized;
+    private locateOutputs;
+    private finalizeAppend;
     shield(input: ShieldParams): Promise<{
         signature: string;
         note: Note;

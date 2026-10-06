@@ -11,3 +11,4 @@ export * from "./wallet.js";
 export * from "./prover.js";
 export * from "./witness.js";
 export * from "./store.js";
+export * from "./archive.js";

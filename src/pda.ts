@@ -19,6 +19,11 @@ export const pda = {
     return PublicKey.findProgramAddressSync([Buffer.from("tree"), pool.toBuffer(), u64(generation)], program);
   },
   custodyA: (pool: PublicKey, programId: PublicKey = PROGRAM_ID) => find("custody-a", pool, programId),
+  pageDirectory: (pool: PublicKey, generation: bigint, programId: PublicKey = PROGRAM_ID) => PublicKey.findProgramAddressSync([Buffer.from("page-dir"), pool.toBuffer(), u64(generation)], programId),
+  leafPage: (pool: PublicKey, generation: bigint, pageIndex: number, programId: PublicKey = PROGRAM_ID) => {
+    if (!Number.isInteger(pageIndex) || pageIndex < 0 || pageIndex >= 16) throw new Error("Page index must be 0..15");
+    return PublicKey.findProgramAddressSync([Buffer.from("leaf-page"), pool.toBuffer(), u64(generation), Buffer.from([pageIndex])], programId);
+  },
   custodyB: (pool: PublicKey, programId: PublicKey = PROGRAM_ID) => find("custody-b", pool, programId),
   spent: (pool: PublicKey, nullifier: Uint8Array, programId: PublicKey = PROGRAM_ID) => PublicKey.findProgramAddressSync([Buffer.from("spent"), pool.toBuffer(), Buffer.from(nullifier)], programId),
   protocolConfig: (programId: PublicKey = PROGRAM_ID) => PublicKey.findProgramAddressSync([Buffer.from("protocol-config")], programId),

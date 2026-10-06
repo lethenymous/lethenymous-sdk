@@ -1,4 +1,5 @@
 import { Connection, PublicKey, TransactionInstruction } from "@solana/web3.js";
+import { type HistoryEvent } from "./witness.js";
 import type { ClientConfig, MerkleWitnessProvider, NoteStore, PoolState, ProtocolConfig, ShieldedState, TransactionOutcome, TreeState, WalletAdapter, Prover, Direction } from "./types.js";
 import { ShieldedWallet } from "./wallet.js";
 export declare function transactionSignatureFromBytes(serialized: Uint8Array): string | undefined;
@@ -65,6 +66,7 @@ export declare class Lethenymous {
     buildAndSendOutcome(instructions: TransactionInstruction[], options?: SendOptions): Promise<TransactionOutcome>;
     reconcileTransaction(signature: string, lastValidBlockHeight?: number, reason?: string): Promise<TransactionOutcome>;
     hasFinalizedProgramEvent(signature: string, name: string, needles?: Uint8Array[]): Promise<boolean>;
+    getFinalizedShieldedEvents(signature: string): Promise<HistoryEvent[]>;
     buildAndSend(instructions: TransactionInstruction[], options?: SendOptions): Promise<string>;
     initializePool(a: PublicKey, b: PublicKey, feeBps: number, creator?: PublicKey): Promise<string>;
     initializeShieldedState(pool: PublicKey): Promise<string>;

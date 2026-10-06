@@ -1,2 +1,3 @@
 export * from "./encoding.js"; export * from "./pda.js"; export * from "./accounts.js"; export * from "./math.js"; export * from "./crypto.js"; export * from "./merkle.js"; export * from "./types.js"; export * from "./instructions.js"; export * from "./client.js";
 export * from "./wallet.js"; export * from "./prover.js"; export * from "./witness.js"; export * from "./store.js";
+export * from "./archive.js";

@@ -201,6 +201,47 @@ export class ShieldedWallet {
         if (journal)
             await journal.markOperationFinalized(operationId);
     }
+    async locateOutputs(kind, pool, signature, outputs, expectedNullifier) {
+        const events = await this.sdk.getFinalizedShieldedEvents(signature);
+        if (kind === "shield") {
+            const matches = events.filter(e => e.kind === "shield" && e.pool.equals(pool) && outputs.length === 1 && same(e.commitment, outputs[0].commitment) && e.amount === outputs[0].amount && same(e.encryptedNote, outputs[0].encryptedPayload));
+            if (matches.length !== 1 || matches[0].kind !== "shield")
+                throw new Error("Finalized shield event does not uniquely bind output note");
+            outputs[0].generation = matches[0].generation;
+            outputs[0].leafIndex = matches[0].index;
+        }
+        else {
+            const matches = events.filter(e => e.kind === "swap" && e.pool.equals(pool) && (!expectedNullifier || key(e.nullifier) === expectedNullifier) && outputs.some(n => same(n.commitment, e.outputCommitment)) && (e.changeIndex === undefined ? outputs.length === 1 : outputs.length === 2 && outputs.some(n => same(n.commitment, e.changeCommitment))));
+            if (matches.length !== 1 || matches[0].kind !== "swap")
+                throw new Error("Finalized swap event does not uniquely bind output notes");
+            const event = matches[0];
+            for (const note of outputs) {
+                note.generation = event.outputGeneration;
+                if (same(note.commitment, event.outputCommitment)) {
+                    if (note.amount !== event.amountOut)
+                        throw new Error("Swap event amount mismatch");
+                    note.leafIndex = event.outputIndex;
+                }
+                else if (same(note.commitment, event.changeCommitment) && event.changeIndex !== undefined)
+                    note.leafIndex = event.changeIndex;
+                else
+                    throw new Error("Unbound output note location");
+            }
+        }
+    }
+    async finalizeAppend(operationId, kind, pool, signature, outputs, input, nullifier) {
+        try {
+            await this.locateOutputs(kind, pool, signature, outputs, nullifier);
+            const journal = this.journal();
+            if (journal)
+                await journal.updateOperation(operationId, { outputNotes: outputs });
+            await this.finalized(operationId, input, outputs);
+        }
+        catch {
+            await this.unknown(operationId, "Finalized transaction requires authenticated note-location recovery", signature);
+            throw new Error("Operation outcome is unknown: finalized transaction note-location persistence is pending reconciliation");
+        }
+    }
     async shield(input) {
         const pool = await this.sdk.getPool(input.pool);
         const active = await this.sdk.ensureTreeCapacity(input.pool, 1);
@@ -224,14 +265,14 @@ export class ShieldedWallet {
             if (balance.amount < totalDebit)
                 throw new Error("Insufficient depositor balance for shield amount plus fee");
             const outcome = await this.sdk.buildAndSendOutcome([
-                shieldIx(this.sdk.wallet.publicKey, pool, stateAccount, asset, input.amount, this.ownerCommitment, randomness, encrypted, depositorA, depositorB, this.sdk.programId),
+                shieldIx(this.sdk.wallet.publicKey, pool, stateAccount, asset, input.amount, this.ownerCommitment, randomness, encrypted, depositorA, depositorB, this.sdk.programId, active.tree),
             ], {
                 onPrepared: async (transaction, lastValidBlockHeight) => { const journal = this.journal(); if (journal)
                     await journal.markPrepared(operationId, transaction, lastValidBlockHeight); },
                 onSubmitted: async (signature) => this.submitted(operationId, signature),
             });
             if (outcome.status === "finalized-success") {
-                await this.finalized(operationId, undefined, [note]);
+                await this.finalizeAppend(operationId, "shield", input.pool, outcome.signature, [note]);
                 return { signature: outcome.signature, note };
             }
             if (outcome.status === "finalized-failed") {
@@ -262,7 +303,7 @@ export class ShieldedWallet {
             reserved = true;
             const pool = await this.sdk.getPool(input.pool);
             const stateAccount = await this.sdk.getShieldedState(input.pool);
-            const witnessValue = await witness.getWitness(input.pool, note.commitment, note.generation ?? 0n);
+            const witnessValue = await witness.getWitness(input.pool, note.commitment, note.generation ?? 0n, note.leafIndex);
             if (witnessValue.generation !== (note.generation ?? 0n))
                 throw new Error("Note generation disagrees with reconstructed witness");
             const nullifierValue = nullifier(input.pool, input.mint, this.spendSecret, note.randomness);
@@ -334,7 +375,7 @@ export class ShieldedWallet {
             const amountOut = swapOutputPreservingLpClaims(reserveIn, reserveOut, input.amountIn, pool.feeBps, lpSupply);
             if (amountOut < input.minAmountOut)
                 throw new Error("Slippage exceeded");
-            const witnessValue = await witness.getWitness(input.pool, note.commitment, note.generation ?? 0n);
+            const witnessValue = await witness.getWitness(input.pool, note.commitment, note.generation ?? 0n, note.leafIndex);
             if (witnessValue.generation !== (note.generation ?? 0n))
                 throw new Error("Note generation disagrees with reconstructed witness");
             const nullifierValue = nullifier(input.pool, input.inputMint, this.spendSecret, note.randomness);
@@ -350,7 +391,7 @@ export class ShieldedWallet {
             outputNote.generation = active.tree.generation;
             await this.sdk.validatePrivateTransactionReady([
                 ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }),
-                privateSwapIx(this.sdk.wallet.publicKey, pool, stateAccount, direction, witnessValue.root, witnessValue.rootSequence, witnessValue.generation, nullifierValue, input.amountIn, amountOut, changeAmount, changeCommitment, outputCommitment, new Uint8Array(256), this.sdk.programId),
+                privateSwapIx(this.sdk.wallet.publicKey, pool, stateAccount, direction, witnessValue.root, witnessValue.rootSequence, witnessValue.generation, nullifierValue, input.amountIn, amountOut, changeAmount, changeCommitment, outputCommitment, new Uint8Array(256), this.sdk.programId, active.tree),
             ]);
             const journal = this.journal();
             if (journal)
@@ -371,7 +412,7 @@ export class ShieldedWallet {
                 await journal.updateOperation(operationId, { outputNotes: [...(changeNote ? [changeNote] : []), outputNote] });
             const outcome = await this.sdk.buildAndSendOutcome([
                 ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }),
-                privateSwapIx(this.sdk.wallet.publicKey, pool, stateAccount, direction, witnessValue.root, witnessValue.rootSequence, witnessValue.generation, nullifierValue, input.amountIn, amountOut, changeAmount, changeCommitment, outputCommitment, result.proof, this.sdk.programId),
+                privateSwapIx(this.sdk.wallet.publicKey, pool, stateAccount, direction, witnessValue.root, witnessValue.rootSequence, witnessValue.generation, nullifierValue, input.amountIn, amountOut, changeAmount, changeCommitment, outputCommitment, result.proof, this.sdk.programId, currentOutput.tree),
             ], {
                 requireVersioned: true,
                 onPrepared: async (transaction, lastValidBlockHeight) => { const journal = this.journal(); if (journal)
@@ -379,7 +420,7 @@ export class ShieldedWallet {
                 onSubmitted: async (signature) => this.submitted(operationId, signature, note),
             });
             if (outcome.status === "finalized-success") {
-                await this.finalized(operationId, note, [...(changeNote ? [changeNote] : []), outputNote]);
+                await this.finalizeAppend(operationId, "private_swap", input.pool, outcome.signature, [...(changeNote ? [changeNote] : []), outputNote], note, key(nullifierValue));
                 return outcome.signature;
             }
             if (outcome.status === "finalized-failed") {
@@ -495,6 +536,16 @@ export class ShieldedWallet {
                 if (!(await this.sdk.hasFinalizedProgramEvent(signature, eventName, needles))) {
                     await journal.markOperationUnknown(operation.id, "Finalized transaction has no authenticated matching event");
                     continue;
+                }
+                if (operation.kind !== "unshield") {
+                    try {
+                        await this.locateOutputs(operation.kind, operation.pool, signature, operation.outputNotes, operation.metadata.nullifier);
+                        await journal.updateOperation(operation.id, { outputNotes: operation.outputNotes });
+                    }
+                    catch {
+                        await journal.markOperationUnknown(operation.id, "Authenticated finalized note locations are unavailable");
+                        continue;
+                    }
                 }
                 if (operation.inputCommitment)
                     await this.store.markSpent(operation.inputCommitment, operation.id);

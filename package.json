@@ -17,6 +17,7 @@
     "README.md",
     "MERKLE_GENERATIONS.md",
     "CHECKPOINT_SCALABILITY.md",
+    "ONCHAIN_MERKLE_ARCHIVE.md",
     "LICENSE"
   ],
   "main": "./dist/index.js",

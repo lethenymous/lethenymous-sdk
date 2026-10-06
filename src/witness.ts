@@ -638,6 +638,14 @@ function programEventLogs(transaction: VersionedTransactionResponse, programId: 
   return result;
 }
 
+export function authenticatedShieldedEvents(transaction: VersionedTransactionResponse, programId: PublicKey): HistoryEvent[] {
+  if (!transaction.meta || transaction.meta.err !== null || !transaction.transaction.signatures[0]) throw new Error("Finalized transaction has no successful authenticated metadata");
+  return programEventLogs(transaction, programId).flatMap(data => {
+    const event = parseShieldedEvent(data, transaction.transaction.signatures[0], transaction.slot);
+    return event ? [event] : [];
+  });
+}
+
 export function parseShieldedEvent(data: Buffer, signature: string, slot: number): HistoryEvent | undefined {
   if (data.subarray(0, 8).equals(SHIELD)) {
     if (data.length < 85) throw new Error("Malformed shield event");

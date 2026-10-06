@@ -2,6 +2,12 @@
 
 ## Feature-branch generation update
 
+The default witness provider now reconstructs depth-16 membership using only
+finalized canonical on-chain page accounts. See
+[ONCHAIN_MERKLE_ARCHIVE.md](ONCHAIN_MERKLE_ARCHIVE.md) for the paired program ABI,
+encrypted output-index persistence, account-only production-proof tests and
+measured packet/CU/rent costs.
+
 The SDK checkpoint remediation is documented in
 [CHECKPOINT_SCALABILITY.md](CHECKPOINT_SCALABILITY.md). It replaces lifetime v2
 event replay with generation-scoped v3 persistence and remains pending source review.
@@ -96,22 +102,14 @@ with atomic reservation and operation transitions. The file contains note
 randomness and pending operation preimages, so it must be protected like the
 seed. Losing both the seed and the journal/backup loses recovery material.
 
-For persistent finalized Merkle reconstruction, pass the same store to
-`RpcMerkleWitnessProvider` as its checkpoint store. Checkpoints are encrypted
-and authenticated sidecars keyed by genesis identity, program, pool, tree, and
-generation. The provider still refreshes finalized tree state and verifies the
-reconstructed root before returning a witness. A custom checkpoint store must
-provide equivalent authenticated, crash-safe replacement semantics.
+The default `OnChainPagedMerkleWitnessProvider` reconstructs membership from
+the finalized tree, directory and all sixteen page accounts; no Merkle sidecars
+or history are needed. Normal encrypted notes retain generation and global leaf
+index. A missing legacy index is recovered by a unique verified commitment scan.
 
 ```ts
-let sdk: Lethenymous;
-const witnessProvider = new RpcMerkleWitnessProvider(
-  connection,
-  programId,
-  pool => sdk.getTree(pool),
-  store,
-);
-sdk = new Lethenymous({ connection, wallet, programId, witnessProvider });
+const witnessProvider = new OnChainPagedMerkleWitnessProvider(connection, programId);
+const sdk = new Lethenymous({ connection, wallet, programId, witnessProvider });
 const shielded = sdk.shieldedWallet(seed, prover, { noteStore: store });
 ```
 
@@ -174,9 +172,9 @@ The repository's extracted development-history provenance is documented in
 
 Spend secrets, view keys, note randomness, commitments, and proving witnesses
 are sensitive. Do not log or upload them. RPC is transport/state access, not a
-trusted prover. The witness provider accepts only finalized successful events
-invoked by the configured zkCPMM program and fails closed on contradictory or
-incomplete history.
+trusted prover. The default witness provider validates finalized canonical
+account bindings and recomputed Poseidon roots. Event-based recovery additionally
+requires successful events invoked by the configured zkCPMM program.
 
 Private Send is an SDK-level use of the existing arbitrary-recipient unshield
 instruction. It does not hide the recipient, amount, asset, payer, timing, or

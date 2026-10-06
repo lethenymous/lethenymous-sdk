@@ -1,4 +1,4 @@
-import { PublicKey, type Connection } from "@solana/web3.js";
+import { PublicKey, type Connection, type VersionedTransactionResponse } from "@solana/web3.js";
 import type { MerkleCheckpointStore, MerkleWitness, MerkleWitnessProvider, TreeState } from "./types.js";
 export interface ShieldAppendEvent {
     kind: "shield";
@@ -75,6 +75,7 @@ export interface MerkleReplayMetrics {
     nullifierWrites: number;
     serializedBytes: number;
 }
+export declare function authenticatedShieldedEvents(transaction: VersionedTransactionResponse, programId: PublicKey): HistoryEvent[];
 export declare function parseShieldedEvent(data: Buffer, signature: string, slot: number): HistoryEvent | undefined;
 export declare class RpcMerkleWitnessProvider implements MerkleWitnessProvider {
     private readonly connection;

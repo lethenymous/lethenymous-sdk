@@ -602,39 +602,64 @@ export class EncryptedFileNoteStore {
     async loadMerkleCheckpoint(identity) {
         const unlock = await this.acquireLock();
         try {
-            let data;
-            try {
-                data = await readFile(this.checkpointPath(identity));
-            }
-            catch (error) {
-                if (error.code === "ENOENT")
-                    return undefined;
-                throw error;
-            }
-            if (data.length < CHECKPOINT_MAGIC.length + 1 + 24 + 16 || !data.subarray(0, CHECKPOINT_MAGIC.length).equals(CHECKPOINT_MAGIC) || data[CHECKPOINT_MAGIC.length] !== CHECKPOINT_VERSION) {
-                throw new Error("Invalid Merkle checkpoint header");
-            }
-            const nonceOffset = CHECKPOINT_MAGIC.length + 1;
-            const nonce = data.subarray(nonceOffset, nonceOffset + 24);
-            const ciphertext = data.subarray(nonceOffset + 24);
-            if (ciphertext.length > MAX_CHECKPOINT + 16)
-                throw new Error("Merkle checkpoint is too large");
-            const aad = Buffer.concat([CHECKPOINT_AAD_PREFIX, Buffer.from(identity)]);
-            try {
-                return Uint8Array.from(xchacha20poly1305(this.encryptionKey, nonce, aad).decrypt(ciphertext));
-            }
-            catch {
-                throw new Error("Invalid Merkle checkpoint integrity");
-            }
+            return await this.readCheckpoint(identity);
         }
         finally {
             await unlock();
         }
     }
+    async readCheckpoint(identity) {
+        let data;
+        try {
+            data = await readFile(this.checkpointPath(identity));
+        }
+        catch (error) {
+            if (error.code === "ENOENT")
+                return undefined;
+            throw error;
+        }
+        if (data.length < CHECKPOINT_MAGIC.length + 1 + 24 + 16 || !data.subarray(0, CHECKPOINT_MAGIC.length).equals(CHECKPOINT_MAGIC) || data[CHECKPOINT_MAGIC.length] !== CHECKPOINT_VERSION) {
+            throw new Error("Invalid Merkle checkpoint header");
+        }
+        const nonceOffset = CHECKPOINT_MAGIC.length + 1;
+        const nonce = data.subarray(nonceOffset, nonceOffset + 24);
+        const ciphertext = data.subarray(nonceOffset + 24);
+        if (ciphertext.length > MAX_CHECKPOINT + 16)
+            throw new Error("Merkle checkpoint is too large");
+        const aad = Buffer.concat([CHECKPOINT_AAD_PREFIX, Buffer.from(identity)]);
+        try {
+            return Uint8Array.from(xchacha20poly1305(this.encryptionKey, nonce, aad).decrypt(ciphertext));
+        }
+        catch {
+            throw new Error("Invalid Merkle checkpoint integrity");
+        }
+    }
     async saveMerkleCheckpoint(identity, checkpoint) {
+        const unlock = await this.acquireLock();
+        try {
+            await this.writeCheckpoint(identity, checkpoint);
+        }
+        finally {
+            await unlock();
+        }
+    }
+    async compareAndSwapMerkleCheckpoint(identity, expectedDigest, checkpoint) {
+        const unlock = await this.acquireLock();
+        try {
+            const current = await this.readCheckpoint(identity);
+            const digest = current && createHash("sha256").update(current).digest("hex");
+            if (digest !== expectedDigest)
+                return false;
+            await this.writeCheckpoint(identity, checkpoint);
+            return true;
+        }
+        finally {
+            await unlock();
+        }
+    }
+    async writeCheckpoint(identity, checkpoint) {
         if (checkpoint.length > MAX_CHECKPOINT)
             throw new Error("Merkle checkpoint is too large");
-        const unlock = await this.acquireLock();
         const path = this.checkpointPath(identity);
         const temporary = `${path}.tmp-${process.pid}-${Date.now()}`;
         try {
@@ -644,17 +669,23 @@ export class EncryptedFileNoteStore {
             const encoded = Buffer.concat([CHECKPOINT_MAGIC, Buffer.from([CHECKPOINT_VERSION]), Buffer.from(nonce), Buffer.from(ciphertext)]);
             const handle = await open(temporary, "wx", 0o600);
             try {
-                await handle.write(encoded);
+                await handle.writeFile(encoded);
                 await handle.sync();
             }
             finally {
                 await handle.close();
             }
             await rename(temporary, path);
+            const directory = await open(dirname(path), "r");
+            try {
+                await directory.sync();
+            }
+            finally {
+                await directory.close();
+            }
         }
         finally {
             await rm(temporary, { force: true });
-            await unlock();
         }
     }
 }

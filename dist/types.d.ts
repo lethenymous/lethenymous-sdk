@@ -79,10 +79,14 @@ export interface MerkleWitness {
 export interface MerkleWitnessProvider {
     getWitness(pool: PublicKey, commitment: Uint8Array, generation?: bigint): Promise<MerkleWitness>;
 }
-/** Implementations must authenticate checkpoint bytes and make replacement writes crash-safe. */
+/** Implementations must authenticate bytes and make replacements crash-safe.
+ * Stores without compare-and-swap must provide externally serialized per-pool writers.
+ */
 export interface MerkleCheckpointStore {
     loadMerkleCheckpoint(identity: string): Promise<Uint8Array | undefined>;
     saveMerkleCheckpoint(identity: string, checkpoint: Uint8Array): Promise<void>;
+    /** Atomic publication for multi-writer stores. Digest is SHA-256 of authenticated plaintext. */
+    compareAndSwapMerkleCheckpoint?(identity: string, expectedDigest: string | undefined, checkpoint: Uint8Array): Promise<boolean>;
 }
 export type NoteState = "available" | "reserved" | "submitted" | "spent";
 export interface Note {

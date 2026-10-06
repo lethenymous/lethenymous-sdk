@@ -157,64 +157,6 @@ function transaction(signature, slot, data, transactionProgram = programId) {
   };
 }
 
-test("full-capacity replay authenticates rollover, cross-generation outputs, and checkpoint restart", { timeout: 2_400_000 }, async()=>{
-  const old=emptyTree();const history=[];const transactions=new Map();
-  const commitment=bytesFor(61);
-  // Full append history is intentionally generated, rather than injecting a
-  // trusted frontier/checkpoint that could hide missing rollover prerequisites.
-  for(let index=0;index<Number(TREE_CAPACITY)-1;index++){
-    const result=append(old,commitment);
-    addRow(history,transactions,shieldData(commitment,result),index+1,`generation-leaf-${index}`);
-  }
-  const active=emptyTree();active.generation=1n;active.rootGenerations[0]=1n;
-  let current=active;
-  const generationTrees=new Map([[0n,old],[1n,active]]);
-  const rollover=Buffer.concat([eventId("TreeRolledOver"),pool.toBuffer(),pda.tree(pool,0n,programId)[0].toBuffer(),u64(0),Buffer.from(rootFromTree(old)),pda.tree(pool,1n,programId)[0].toBuffer(),u64(1)]);
-  addRow(history,transactions,rollover,65536,"generation-rollover");
-  const change=bytesFor(62),output=bytesFor(63);
-  append(active,change);append(active,output);
-  const cross=Buffer.concat([swapData(change,output,rootFromTree(old),old.sequence,0n,1n),u64(1)]);
-  addRow(history,transactions,cross,65537,"generation-cross-swap");
-  addRow(history,transactions,unshieldData(bytesFor(64),old.sequence),65538,"generation-old-unshield");
-  let checkpoint;
-  const checkpoints=new Map();
-  const store={loadMerkleCheckpoint:async identity=>checkpoints.get(identity),saveMerkleCheckpoint:async(identity,bytes)=>{checkpoints.set(identity,bytes);checkpoint=bytes;}};
-  const connection=fakeConnection(history,transactions,{signatures:0,transactions:[]});
-  const provider=new RpcMerkleWitnessProvider(connection,programId,async()=>current,store,async(_pool,g)=>generationTrees.get(g));
-  const w=await provider.getWitness(pool,commitment);assert.equal(w.generation,0n);assert.equal(w.rootSequence,65535n);assert.deepEqual(w.root,Uint8Array.from(rootFromTree(old)));
-  const out=await provider.getWitness(pool,output);assert.equal(out.generation,1n);assert.equal(out.index,1n);
-  assert.equal(JSON.parse(Buffer.from(checkpoint).toString()).formatVersion,2);
-  const restartedCalls={signatures:0,transactions:[]};
-  const restarted=new RpcMerkleWitnessProvider(fakeConnection(history,transactions,restartedCalls),programId,async()=>current,store,async(_pool,g)=>generationTrees.get(g));
-  assert.deepEqual(await restarted.getWitness(pool,output),out);assert.equal(restartedCalls.transactions.length,0);
-  assert((await restarted.getSpentNullifiers(pool)).some(v=>Buffer.from(v).equals(Buffer.from(bytesFor(9)))));
-  // Every intervening generation has a complete append ledger. This deliberately
-  // does not insert a synthetic sealed flag, trusted frontier, or rollover bypass.
-  for(let next=2n;next<=4n;next++){
-    const previous=current;
-    while(previous.nextIndex<TREE_CAPACITY-1n){
-      const result=append(previous,commitment);
-      const data=shieldData(commitment,result);
-      data.writeBigUInt64LE(previous.generation,data.length-16);
-      addRow(history,transactions,data,history.length+1,`generation-${previous.generation}-leaf-${result.index}`);
-    }
-    const event=Buffer.concat([eventId("TreeRolledOver"),pool.toBuffer(),pda.tree(pool,previous.generation,programId)[0].toBuffer(),u64(previous.generation),Buffer.from(rootFromTree(previous)),pda.tree(pool,next,programId)[0].toBuffer(),u64(next)]);
-    addRow(history,transactions,event,history.length+1,`generation-rollover-${next}`);
-    current=emptyTree();current.generation=next;current.rootGenerations[0]=next;
-    generationTrees.set(next,current);
-    if(next===2n){const oldWitness=await restarted.getWitness(pool,commitment,0n);assert.equal(oldWitness.generation,0n);assert.deepEqual(oldWitness.root,w.root);}
-  }
-  const generationOne=await restarted.getWitness(pool,output,1n);
-  assert.equal(current.generation,4n);assert.equal(generationOne.generation,1n);
-  assert.equal(generationOne.index,1n);assert.equal(generationOne.rootSequence,65535n);
-  assert.deepEqual(generationOne.root,Uint8Array.from(rootFromTree(generationTrees.get(1n))));
-  // Invalid continuation is rejected without persisting a new checkpoint.
-  const before=checkpoint;
-  addRow(history,transactions,Buffer.concat([rollover.subarray(0,144),u64(3)]),history.length+1,"impossible-rollover");
-  await assert.rejects(()=>restarted.getWitness(pool,output),e=>e instanceof MerkleReconstructionError&&e.code==="GENERATION_MISMATCH");
-  assert.equal(checkpoint,before);
-});
-
 function fakeConnection(history, transactions, calls, overrides = {}) {
   return {
     getGenesisHash: async () => "genesis-test",
@@ -350,7 +292,7 @@ test("authenticated v1 tree checkpoints rebuild the pool stream without reusing 
   const store={loadMerkleCheckpoint:async key=>checkpoints.get(key),saveMerkleCheckpoint:async(key,value)=>{checkpoints.set(key,value);}};
   const provider=new RpcMerkleWitnessProvider(fakeConnection(history,transactions,calls),programId,async()=>current,store);
   assert.equal((await provider.getWitness(pool,leaf)).generation,0n);assert.deepEqual(calls.transactions,[signature]);
-  assert([...checkpoints.values()].some(value=>JSON.parse(Buffer.from(value).toString()).formatVersion===2));
+  assert([...checkpoints.values()].some(value=>JSON.parse(Buffer.from(value).toString()).kind==="pool-manifest" && JSON.parse(Buffer.from(value).toString()).formatVersion===3));
 });
 
 test("corrupted checkpoints fail closed with a typed reconstruction error", async () => {

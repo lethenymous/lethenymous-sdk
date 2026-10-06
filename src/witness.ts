@@ -121,12 +121,36 @@ interface ReplayState {
 }
 
 interface PoolReplayState {
-  generations: Map<bigint, ReplayState>;
-  activeGeneration: bigint;
-  events: HistoryEvent[];
-  spentNullifiers: Set<string>;
-  lastProcessedSignature?: string;
-  lastFinalizedSlot?: number;
+  manifest: PoolManifest;
+  manifestBytes?: Uint8Array;
+  active?: ReplayState;
+}
+
+interface BlobRef { key: string; digest: string; }
+interface GenerationHead { base: BlobRef; tail?: BlobRef; segments: number; }
+interface PoolManifest {
+  formatVersion: 3;
+  kind: "pool-manifest";
+  identity: Record<string, string>;
+  activeGeneration: string;
+  head: GenerationHead;
+  summary: { nextIndex: string; sequence: string; root: string };
+  cursor: { lastProcessedSignature?: string; lastFinalizedSlot?: number };
+  nullifierHead?: BlobRef;
+}
+
+export interface MerkleReplayMetrics {
+  generationLoads: number;
+  validatedLeaves: number;
+  replayedAppends: number;
+  serializedAppends: number;
+  sealedWrites: number;
+  activeDeltaWrites: number;
+  manifestWrites: number;
+  historyTransactions: number;
+  nullifierReads: number;
+  nullifierWrites: number;
+  serializedBytes: number;
 }
 
 interface HistoryRow {
@@ -709,51 +733,63 @@ async function retryTransaction(connection: Connection, signature: string): Prom
   }
 }
 
-function poolInitial(identity: CheckpointIdentity, current: TreeState): PoolReplayState {
-  const generationZero = cloneInitialTree(current.pool, { ...current, generation: 0n });
-  return { generations: new Map([[0n, { identity: { ...identity, generation: 0n }, tree: generationZero, appends: new Map(), spentNullifiers: new Set() }]]),
-    activeGeneration: 0n, events: [], spentNullifiers: new Set() };
+const digest = (data: Uint8Array) => createHash("sha256").update(data).digest("hex");
+const MAX_SEGMENTS = 64;
+
+function checkedBytes(value: Record<string, unknown>): Uint8Array {
+  return Buffer.from(JSON.stringify({ ...value, integrity: { algorithm: "sha256", digest: digest(Buffer.from(JSON.stringify(value))) } }));
 }
 
-function applyPoolEvent(state: PoolReplayState, pool: PublicKey, program: PublicKey, event: HistoryEvent): void {
-  assertIdentity(pool, event);
-  if (event.kind === "rollover") {
-    const previous = state.generations.get(state.activeGeneration)!;
-    if (event.previousGeneration !== state.activeGeneration || event.newGeneration !== event.previousGeneration + 1n || event.newGeneration > 0xffffffffffffffffn)
-      reconstruction("GENERATION_MISMATCH", "Impossible rollover generation continuity");
-    if (!event.previousTree.equals(pda.tree(pool, event.previousGeneration, program)[0]) || !event.newTree.equals(pda.tree(pool, event.newGeneration, program)[0]))
-      reconstruction("GENERATION_MISMATCH", "Rollover PDA/generation mismatch");
-    if (TREE_CAPACITY - previous.tree.nextIndex > 1n || !same(rootFromTree(previous.tree), event.previousFinalRoot))
-      reconstruction("ROOT_MISMATCH", "Rollover final root or remaining capacity mismatch");
-    const tree = cloneInitialTree(pool, { ...previous.tree, generation: event.newGeneration });
-    state.generations.set(event.newGeneration, { identity: { ...previous.identity, tree: event.newTree.toBase58(), generation: event.newGeneration }, tree, appends: new Map(), spentNullifiers: new Set() });
-    state.activeGeneration = event.newGeneration;
+function checkedObject(data: Uint8Array): Record<string, unknown> {
+  let value: Record<string, unknown>;
+  try { value = JSON.parse(Buffer.from(data).toString("utf8")); }
+  catch { reconstruction("INVALID_CHECKPOINT", "Checkpoint is not valid JSON"); }
+  if (!value || typeof value !== "object" || Array.isArray(value)) reconstruction("INVALID_CHECKPOINT", "Invalid checkpoint object");
+  const integrity = value.integrity as { algorithm?: string; digest?: string } | undefined;
+  const base = { ...value }; delete base.integrity;
+  if (integrity?.algorithm !== "sha256" || integrity.digest !== digest(Buffer.from(JSON.stringify(base)))) reconstruction("INVALID_CHECKPOINT", "Checkpoint integrity mismatch");
+  return base;
+}
+
+function reference(value: unknown): BlobRef {
+  const ref = value as BlobRef | undefined;
+  if (!ref || typeof ref.key !== "string" || !/^[0-9a-f]{64}$/.test(ref.digest)) reconstruction("INVALID_CHECKPOINT", "Invalid checkpoint reference");
+  return { key: ref.key, digest: ref.digest };
+}
+
+function recordObject(record: AppendRecord): Record<string, unknown> {
+  return { index: record.index.toString(), sequence: record.sequence.toString(), commitment: hex(record.commitment), event: serializeEvent(record.event) };
+}
+
+function readRecord(value: unknown): AppendRecord {
+  if (!value || typeof value !== "object") reconstruction("INVALID_CHECKPOINT", "Invalid generation append record");
+  const r = value as Record<string, unknown>;
+  return { index: parseBigInt(r.index, "index"), sequence: parseBigInt(r.sequence, "sequence"), commitment: parseBytes(r.commitment, 32, "commitment"), event: deserializeEvent(r.event) };
+}
+
+/** Reconstruct ONLY one generation's leaves; cross-generation input history is not needed. */
+function applyStoredRecord(state: ReplayState, record: AppendRecord): void {
+  const e = record.event;
+  if (record.index !== state.tree.nextIndex || record.sequence !== record.index + 1n || !e.pool.equals(state.tree.pool)) reconstruction("INVALID_CHECKPOINT", "Generation append continuity/identity mismatch");
+  if (e.kind === "shield") {
+    if (e.generation !== state.tree.generation || e.index !== record.index || e.sequence !== record.sequence || e.amount <= 0n || e.asset > 1 || e.encryptedNote.length !== 186 || e.encryptedNote[0] !== 1 || !same(e.commitment, record.commitment)) reconstruction("INVALID_CHECKPOINT", "Invalid shield append record");
   } else {
-    const input = state.generations.get(event.generation);
-    if (!input) reconstruction("GENERATION_MISMATCH", "Input generation has not been initialized by rollover");
-    if (event.kind === "shield") {
-      if (event.generation !== state.activeGeneration) reconstruction("GENERATION_MISMATCH", "Shield appended into a historical generation");
-      applyEvent(input, pool, event);
-    } else {
-      if (event.kind === "unshield" && (event.amount <= 0n || event.asset > 1)) reconstruction("HISTORY_GAP", "Invalid unshield fields");
-      if (!canonicalField(event.nullifier) || same(event.nullifier, new Uint8Array(32))) reconstruction("HISTORY_GAP", "Invalid nullifier in history");
-      const nf = hex(event.nullifier);
-      if (state.spentNullifiers.has(nf)) reconstruction("DUPLICATE_EVENT", "Duplicate pool-global nullifier in history");
-      if (event.kind === "unshield") assertAcceptedRoot(input.tree, event.rootSequence);
-      else {
-        assertAcceptedRoot(input.tree, event.rootSequence, event.root);
-        if (event.outputGeneration !== state.activeGeneration) reconstruction("GENERATION_MISMATCH", "Swap output generation is not active");
-        const output = state.generations.get(event.outputGeneration)!;
-        const next = output.tree.nextIndex;
-        if (event.changeIndex !== undefined && event.changeIndex !== next || event.outputIndex !== next + (event.changeIndex === undefined ? 0n : 1n))
-          reconstruction("SEQUENCE_GAP", "Cross-generation swap output indices are not contiguous");
-        if (event.changeIndex !== undefined) appendRecord(output, appendLeaf(output.tree,event.changeCommitment),event.changeCommitment,event);
-        appendRecord(output, appendLeaf(output.tree,event.outputCommitment),event.outputCommitment,event);
-      }
-      state.spentNullifiers.add(nf);
+    if (e.outputGeneration !== state.tree.generation || e.direction > 1 || e.amountIn <= 0n || e.amountOut <= 0n || !canonicalField(e.root) || !canonicalField(e.nullifier)) reconstruction("INVALID_CHECKPOINT", "Invalid swap append record");
+    const expected = record.index === e.changeIndex ? e.changeCommitment : record.index === e.outputIndex ? e.outputCommitment : undefined;
+    if (!expected || !same(expected, record.commitment) || (e.changeIndex !== undefined && e.outputIndex !== e.changeIndex + 1n)) reconstruction("INVALID_CHECKPOINT", "Swap append commitment/index mismatch");
+    if (record.index === e.outputIndex && e.changeIndex !== undefined) {
+      const change = state.appends.get(e.changeIndex);
+      if (!change || JSON.stringify(serializeEvent(change.event)) !== JSON.stringify(serializeEvent(e))) reconstruction("INVALID_CHECKPOINT", "Swap outputs were not persisted together");
     }
   }
-  state.events.push(event);
+  const result = appendLeaf(state.tree, record.commitment);
+  if (e.kind === "shield" && !same(result.root, e.root)) reconstruction("INVALID_CHECKPOINT", "Shield checkpoint root mismatch");
+  state.appends.set(record.index, record);
+}
+
+function completeGeneration(state: ReplayState): void {
+  const last = state.appends.get(state.tree.nextIndex - 1n);
+  if (last?.event.kind === "swap" && last.index !== last.event.outputIndex) reconstruction("INVALID_CHECKPOINT", "Incomplete atomic swap outputs");
 }
 
 function serializeHistory(event: HistoryEvent): Record<string, unknown> {
@@ -772,16 +808,15 @@ function deserializeHistory(value: unknown): HistoryEvent {
   reconstruction("INVALID_CHECKPOINT","Unknown pool event");
 }
 
-function serializePoolCheckpoint(state: PoolReplayState, identity: Record<string,string>): Uint8Array {
-  const base = { formatVersion:2, identity, events:state.events.map(serializeHistory), cursor:{ lastProcessedSignature:state.lastProcessedSignature,lastFinalizedSlot:state.lastFinalizedSlot },
-    trees:[...state.generations.values()].map(s=>serializeTree(s.tree)) };
-  return Buffer.from(JSON.stringify({ ...base,integrity:{ algorithm:"sha256",digest:createHash("sha256").update(JSON.stringify(base)).digest("hex") } }));
-}
-
 export class RpcMerkleWitnessProvider implements MerkleWitnessProvider {
   private readonly states = new Map<string, PoolReplayState>();
   private readonly syncing = new Map<string, Promise<PoolReplayState>>();
   private genesisHash?: string;
+  private readonly blobs = new Map<string, Uint8Array>();
+  private readonly historical = new Map<string, ReplayState>();
+  private readonly metrics: MerkleReplayMetrics = { generationLoads: 0, validatedLeaves: 0, replayedAppends: 0, serializedAppends: 0, sealedWrites: 0, activeDeltaWrites: 0, manifestWrites: 0, historyTransactions: 0, nullifierReads: 0, nullifierWrites: 0, serializedBytes: 0 };
+
+  getReplayMetrics(): MerkleReplayMetrics { return { ...this.metrics }; }
 
   constructor(
     private readonly connection: Connection,
@@ -898,76 +933,347 @@ export class RpcMerkleWitnessProvider implements MerkleWitnessProvider {
     return result;
   }
 
-  private async savePoolCheckpoint(identity: string, data: Uint8Array): Promise<void> {
-    const store = this.checkpointStore!;
-    // Per-store checkpoints are bounded (the encrypted journal uses 64 MiB).
-    // Content-addressed chunks are written before the atomic manifest switch.
-    // Old manifests remain readable if the process stops partway through a save.
-    const chunkSize = 8 * 1024 * 1024;
-    if (data.length <= chunkSize) { await store.saveMerkleCheckpoint(identity, data); return; }
-    const digests: string[] = [];
-    for (let offset = 0; offset < data.length; offset += chunkSize) {
-      const chunk = data.subarray(offset, offset + chunkSize);
-      const digest = createHash("sha256").update(chunk).digest("hex");
-      digests.push(digest);
-      await store.saveMerkleCheckpoint(JSON.stringify({ poolCheckpoint: identity, sha256: digest }), chunk);
+  private storageKey(identity: Record<string, string>, kind: string, generation?: bigint, hash?: string): string {
+    return JSON.stringify({ schema: "merkle-v3", identity, kind, generation: generation?.toString(), hash });
+  }
+
+  private async read(key: string): Promise<Uint8Array | undefined> {
+    try { return this.checkpointStore ? await this.checkpointStore.loadMerkleCheckpoint(key) : this.blobs.get(key); }
+    catch { reconstruction("INVALID_CHECKPOINT", "Checkpoint authentication/read failed"); }
+  }
+
+  private async immutable(key: string, data: Uint8Array): Promise<boolean> {
+    const existing = await this.read(key);
+    if (existing) {
+      if (!same(existing, data)) reconstruction("INVALID_CHECKPOINT", "Conflicting immutable checkpoint write");
+      return false;
     }
-    await store.saveMerkleCheckpoint(identity, Buffer.from(JSON.stringify({ formatVersion: 2, identity, chunked: true, byteLength: data.length,
-      digest: createHash("sha256").update(data).digest("hex"), chunks: digests })));
+    if (!this.checkpointStore) { this.blobs.set(key, cloneBytes(data)); return true; }
+    if (this.checkpointStore.compareAndSwapMerkleCheckpoint) {
+      if (!await this.checkpointStore.compareAndSwapMerkleCheckpoint(key, undefined, data)) {
+        const winner = await this.read(key);
+        if (!winner || !same(winner, data)) reconstruction("INVALID_CHECKPOINT", "Concurrent immutable checkpoint conflict");
+        return false;
+      }
+    } else await this.checkpointStore.saveMerkleCheckpoint(key, data);
+    return true;
+  }
+
+  private async putBlob(identity: Record<string, string>, generation: bigint | undefined, data: Uint8Array): Promise<BlobRef> {
+    const hash = digest(data);
+    const key = this.storageKey(identity, "blob", generation, hash);
+    const chunkSize = 8 * 1024 * 1024;
+    if (data.length <= chunkSize) await this.immutable(key, data);
+    else {
+      const chunks: BlobRef[] = [];
+      for (let offset = 0; offset < data.length; offset += chunkSize) {
+        const chunk = data.subarray(offset, offset + chunkSize);
+        const ref = { key: this.storageKey(identity, "chunk", generation, digest(chunk)), digest: digest(chunk) };
+        await this.immutable(ref.key, chunk); chunks.push(ref);
+      }
+      await this.immutable(key, checkedBytes({ formatVersion: 3, kind: "chunked-blob", digest: hash, byteLength: data.length, chunks }));
+    }
+    this.metrics.serializedBytes += data.length;
+    return { key, digest: hash };
+  }
+
+  private async readBlob(identity: Record<string, string>, generation: bigint | undefined, ref: BlobRef): Promise<Uint8Array> {
+    if (ref.key !== this.storageKey(identity, "blob", generation, ref.digest)) reconstruction("INVALID_CHECKPOINT", "Blob scope mismatch");
+    const data = await this.read(ref.key);
+    if (!data) reconstruction("INVALID_CHECKPOINT", "Checkpoint blob is missing");
+    if (digest(data) === ref.digest) return data;
+    const wrapper = checkedObject(data);
+    if (wrapper.formatVersion !== 3 || wrapper.kind !== "chunked-blob" || wrapper.digest !== ref.digest || !Array.isArray(wrapper.chunks)) reconstruction("INVALID_CHECKPOINT", "Blob digest mismatch");
+    const buffers: Uint8Array[] = [];
+    for (const value of wrapper.chunks) {
+      const chunk = reference(value);
+      if (chunk.key !== this.storageKey(identity, "chunk", generation, chunk.digest)) reconstruction("INVALID_CHECKPOINT", "Chunk scope mismatch");
+      const bytes = await this.read(chunk.key);
+      if (!bytes || bytes.length > 8 * 1024 * 1024 || digest(bytes) !== chunk.digest) reconstruction("INVALID_CHECKPOINT", "Checkpoint chunk is missing/corrupt");
+      buffers.push(bytes);
+    }
+    const joined = Buffer.concat(buffers);
+    if (joined.length !== wrapper.byteLength || digest(joined) !== ref.digest) reconstruction("INVALID_CHECKPOINT", "Assembled checkpoint integrity mismatch");
+    return joined;
+  }
+
+  private generationIdentity(identity: Record<string, string>, generation: bigint): CheckpointIdentity {
+    const pool = new PublicKey(identity.pool);
+    return { genesisHash: identity.genesisHash, programId: identity.programId, pool: identity.pool, tree: pda.tree(pool, generation, this.programId)[0].toBase58(), generation };
+  }
+
+  private initial(identity: Record<string, string>, current: TreeState, generation: bigint): ReplayState {
+    return { identity: this.generationIdentity(identity, generation), tree: cloneInitialTree(current.pool, { ...current, generation }), appends: new Map(), spentNullifiers: new Set() };
+  }
+
+  private assertGenerationObject(value: Record<string, unknown>, identity: Record<string, string>, generation: bigint, kind: string): void {
+    if (value.formatVersion !== 3 || value.kind !== kind || JSON.stringify(value.identity) !== identityKey(this.generationIdentity(identity, generation))) reconstruction("INVALID_CHECKPOINT", "Generation checkpoint identity/version/PDA mismatch");
+  }
+
+  private async snapshot(identity: Record<string, string>, state: ReplayState, sealed: boolean): Promise<BlobRef> {
+    this.metrics.serializedAppends += state.appends.size;
+    return this.putBlob(identity, state.tree.generation, checkedBytes({ formatVersion: 3, kind: "generation-snapshot", identity: identityObject(state.identity), sealed,
+      tree: serializeTree(state.tree), appends: [...state.appends.values()].map(recordObject) }));
+  }
+
+  private async loadGeneration(identity: Record<string, string>, generation: bigint, head: GenerationHead, sealed: boolean): Promise<ReplayState> {
+    this.metrics.generationLoads++;
+    const base = checkedObject(await this.readBlob(identity, generation, head.base));
+    this.assertGenerationObject(base, identity, generation, "generation-snapshot");
+    if (base.sealed !== sealed || !Array.isArray(base.appends)) reconstruction("INVALID_CHECKPOINT", "Invalid generation snapshot role/records");
+    const claimed = deserializeTree(base.tree);
+    validateTreeShape(claimed, "generation snapshot");
+    if (!claimed.pool.equals(new PublicKey(identity.pool)) || claimed.generation !== generation) reconstruction("INVALID_CHECKPOINT", "Generation tree identity mismatch");
+    const state = this.initial(identity, claimed, generation);
+    const apply = (records: unknown[]) => { for (const value of records) { applyStoredRecord(state, readRecord(value)); this.metrics.validatedLeaves++; } completeGeneration(state); };
+    apply(base.appends); compareTreeState(state.tree, claimed);
+    if (sealed && TREE_CAPACITY - state.tree.nextIndex > 1n) reconstruction("INVALID_CHECKPOINT", "Sealed generation was not rollover-ready");
+    if (!Number.isSafeInteger(head.segments) || head.segments < 0 || head.segments > MAX_SEGMENTS || (head.segments === 0) !== (head.tail === undefined) || sealed && head.segments !== 0) reconstruction("INVALID_CHECKPOINT", "Invalid generation delta head");
+    const segments: Record<string, unknown>[] = [];
+    let tail = head.tail;
+    while (tail) {
+      if (segments.length >= head.segments) reconstruction("INVALID_CHECKPOINT", "Generation delta chain exceeds declared length");
+      const segment = checkedObject(await this.readBlob(identity, generation, tail));
+      this.assertGenerationObject(segment, identity, generation, "generation-delta");
+      if (segment.baseDigest !== head.base.digest || !Array.isArray(segment.appends)) reconstruction("INVALID_CHECKPOINT", "Generation delta belongs to another base");
+      segments.push(segment); tail = segment.previous === undefined ? undefined : reference(segment.previous);
+    }
+    if (segments.length !== head.segments) reconstruction("INVALID_CHECKPOINT", "Generation delta chain is incomplete");
+    for (const segment of segments.reverse()) { apply(segment.appends as unknown[]); compareTreeState(state.tree, deserializeTree(segment.tree)); }
+    return state;
+  }
+
+  private async sealedGeneration(identity: Record<string, string>, generation: bigint): Promise<ReplayState> {
+    if (!this.checkpointStore) return this.recoverVolatileGeneration(identity, generation);
+    const key = this.storageKey(identity, "sealed-generation", generation);
+    const data = await this.read(key);
+    if (!data) reconstruction("INVALID_CHECKPOINT", "Historical generation checkpoint is missing");
+    const locator = checkedObject(data);
+    this.assertGenerationObject(locator, identity, generation, "sealed-generation");
+    const ref = reference(locator.snapshot);
+    let state = this.historical.get(key);
+    if (!state || state.lastProcessedSignature !== ref.digest) {
+      state = await this.loadGeneration(identity, generation, { base: ref, segments: 0 }, true);
+      state.lastProcessedSignature = ref.digest;
+      this.historical.delete(key); this.historical.set(key, state);
+      // Leaf-set cache is independent of total lifetime generation count.
+      while (this.historical.size > 2) this.historical.delete(this.historical.keys().next().value!);
+    }
+    compareTreeState(state.tree, await this.historicalTree(new PublicKey(identity.pool), generation));
+    return state;
+  }
+
+  private async recoverVolatileGeneration(identity: Record<string, string>, generation: bigint): Promise<ReplayState> {
+    const pool = new PublicKey(identity.pool), chain = await this.historicalTree(pool, generation);
+    const cacheKey = this.storageKey(identity, "volatile-generation", generation);
+    const cached = this.historical.get(cacheKey);
+    if (cached) { compareTreeState(cached.tree, chain); return cached; }
+    // No storage was configured: recover the requested tree's public appends
+    // rather than retaining every sealed leaf set/serialized archive in RAM.
+    const state = this.initial(identity, chain, generation);
+    const rows = await this.collectRows(pda.tree(pool, generation, this.programId)[0]);
+    for (const row of rows) {
+      const transaction = await this.transaction(row);
+      if (transaction.meta!.err !== null || !messageHasProgramInstruction(transaction, this.programId, new PublicKey(identity.stream))) continue;
+      for (const data of programEventLogs(transaction, this.programId)) {
+        let event: HistoryEvent | undefined;
+        try { event = parseShieldedEvent(data, row.signature, row.slot); }
+        catch { reconstruction("HISTORY_GAP", "Malformed generation recovery event"); }
+        if (!event || !event.pool.equals(pool)) continue;
+        if (event.kind === "shield" && event.generation === generation) applyStoredRecord(state, { index: event.index, sequence: event.index + 1n, commitment: event.commitment, event });
+        if (event.kind === "swap" && event.outputGeneration === generation) {
+          if (event.changeIndex !== undefined) applyStoredRecord(state, { index: event.changeIndex, sequence: event.changeIndex + 1n, commitment: event.changeCommitment, event });
+          applyStoredRecord(state, { index: event.outputIndex, sequence: event.outputIndex + 1n, commitment: event.outputCommitment, event });
+        }
+      }
+    }
+    completeGeneration(state); compareTreeState(state.tree, chain);
+    this.historical.set(cacheKey, state);
+    while (this.historical.size > 2) this.historical.delete(this.historical.keys().next().value!);
+    return state;
+  }
+
+  private async publish(key: string, previous: Uint8Array | undefined, next: Uint8Array): Promise<void> {
+    if (this.checkpointStore?.compareAndSwapMerkleCheckpoint) {
+      if (!await this.checkpointStore.compareAndSwapMerkleCheckpoint(key, previous && digest(previous), next)) reconstruction("HISTORY_GAP", "Concurrent checkpoint publication; retry from authenticated manifest");
+    } else {
+      const current = await this.read(key);
+      if ((current === undefined) !== (previous === undefined) || current && previous && !same(current, previous)) reconstruction("HISTORY_GAP", "Checkpoint cursor changed during publication");
+      if (this.checkpointStore) await this.checkpointStore.saveMerkleCheckpoint(key, next);
+      else this.blobs.set(key, cloneBytes(next));
+    }
+    this.metrics.manifestWrites++;
+  }
+
+  private manifest(data: Uint8Array, identity: Record<string, string>): PoolManifest {
+    const value = checkedObject(data);
+    if (value.formatVersion !== 3 || value.kind !== "pool-manifest" || JSON.stringify(value.identity) !== JSON.stringify(identity)) reconstruction("INVALID_CHECKPOINT", "Pool manifest identity/version mismatch");
+    const generation = parseBigInt(value.activeGeneration, "active generation");
+    if (generation > 0xffffffffffffffffn) reconstruction("INVALID_CHECKPOINT", "Generation exceeds u64");
+    const head = value.head as GenerationHead;
+    if (!head || !Number.isSafeInteger(head.segments) || head.segments < 0 || head.segments > MAX_SEGMENTS) reconstruction("INVALID_CHECKPOINT", "Invalid active head");
+    reference(head.base); if (head.tail) reference(head.tail);
+    if ((head.segments === 0) !== (head.tail === undefined)) reconstruction("INVALID_CHECKPOINT", "Inconsistent active delta head");
+    const summary = value.summary as PoolManifest["summary"];
+    if (!summary || parseBigInt(summary.nextIndex, "next index") > TREE_CAPACITY || parseBigInt(summary.sequence, "sequence") !== BigInt(summary.nextIndex)) reconstruction("INVALID_CHECKPOINT", "Invalid active counters");
+    parseBytes(summary.root, 32, "active root");
+    const cursor = value.cursor as PoolManifest["cursor"];
+    if (!cursor || (cursor.lastProcessedSignature === undefined) !== (cursor.lastFinalizedSlot === undefined)) reconstruction("INVALID_CHECKPOINT", "Invalid finalized cursor");
+    if (cursor.lastProcessedSignature !== undefined && (typeof cursor.lastProcessedSignature !== "string" || !cursor.lastProcessedSignature.length)) reconstruction("INVALID_CHECKPOINT", "Invalid cursor signature");
+    if (cursor.lastFinalizedSlot !== undefined) parseSafeInteger(cursor.lastFinalizedSlot, "cursor slot");
+    if (value.nullifierHead !== undefined) reference(value.nullifierHead);
+    return value as unknown as PoolManifest;
+  }
+
+  private compareSummary(manifest: PoolManifest, tree: TreeState): void {
+    if (manifest.activeGeneration !== tree.generation.toString() || manifest.summary.nextIndex !== tree.nextIndex.toString() || manifest.summary.sequence !== tree.sequence.toString() || manifest.summary.root !== hex(rootFromTree(tree))) reconstruction("ROOT_MISMATCH", "Manifest summary disagrees with canonical finalized active tree");
+  }
+
+  private async activeState(session: PoolReplayState): Promise<ReplayState> {
+    if (!session.active) {
+      session.active = await this.loadGeneration(session.manifest.identity, BigInt(session.manifest.activeGeneration), session.manifest.head, false);
+      this.compareSummary(session.manifest, session.active.tree);
+    }
+    return session.active;
+  }
+
+  private async nullifier(identity: Record<string, string>, event: PrivateSwapEvent | UnshieldEvent, eventOffset: number, pending: Map<string, Uint8Array>): Promise<void> {
+    if (!canonicalField(event.nullifier) || same(event.nullifier, new Uint8Array(32))) reconstruction("HISTORY_GAP", "Invalid pool-global nullifier");
+    const nf = hex(event.nullifier);
+    if (pending.has(nf)) reconstruction("DUPLICATE_EVENT", "Duplicate pool-global nullifier in suffix");
+    const data = checkedBytes({ formatVersion: 3, kind: "nullifier-record", identity, nullifier: nf, signature: event.signature, slot: event.slot, eventOffset });
+    const existing = await this.read(this.storageKey(identity, "nullifier-index", undefined, nf));
+    this.metrics.nullifierReads++;
+    if (existing) {
+      const record = checkedObject(existing);
+      if (record.formatVersion !== 3 || record.kind !== "nullifier-record" || JSON.stringify(record.identity) !== JSON.stringify(identity) || record.nullifier !== nf) reconstruction("INVALID_CHECKPOINT", "Invalid global nullifier index record");
+      // Retry of an unpublished batch is idempotent. A different transaction or
+      // event position is a replay, regardless of its input/output generation.
+      if (!same(existing, data)) reconstruction("DUPLICATE_EVENT", "Pool-global nullifier was spent by a different event");
+    }
+    pending.set(nf, data);
+  }
+
+  private async flushNullifiers(manifest: PoolManifest, pending: Map<string, Uint8Array>): Promise<void> {
+    if (!pending.size) return;
+    const values = [...pending];
+    for (const [nf, data] of values) {
+      if (await this.immutable(this.storageKey(manifest.identity, "nullifier-index", undefined, nf), data)) this.metrics.nullifierWrites++;
+    }
+    for (let offset = 0; offset < values.length; offset += 4096) {
+      manifest.nullifierHead = await this.putBlob(manifest.identity, undefined, checkedBytes({ formatVersion: 3, kind: "nullifier-segment", identity: manifest.identity,
+        previous: manifest.nullifierHead, entries: values.slice(offset, offset + 4096).map(([nf, data]) => ({ nullifier: nf, digest: digest(data) })) }));
+    }
+    pending.clear();
   }
 
   private async syncPool(pool: PublicKey): Promise<PoolReplayState> {
     const current = await this.getTree(pool);
     validateTreeShape(current, "finalized tree");
     if (!current.pool.equals(pool)) reconstruction("INVALID_TREE", "Finalized tree belongs to another pool");
-    const legacyIdentity = await this.identity(pool, { ...current, generation:0n });
-    const identity = { genesisHash:legacyIdentity.genesisHash,programId:this.programId.toBase58(),pool:pool.toBase58(),stream:pda.shielded(pool,this.programId)[0].toBase58(),format:"pool-generations-v2" };
-    const stateKey=JSON.stringify(identity);
-    let state=this.states.get(stateKey);
-    if (state) state={ ...state,generations:new Map([...state.generations].map(([g,s])=>[g,cloneState(s)])),events:[...state.events],spentNullifiers:new Set(state.spentNullifiers) };
-    else {
-      state=poolInitial(legacyIdentity,current);
-      let data:Uint8Array|undefined;
-      try { data=await this.poolCheckpointBytes(stateKey); }
-      catch { reconstruction("INVALID_CHECKPOINT","Unable to authenticate pool checkpoint"); }
-      if (data) {
-        let payload:Record<string,unknown>;
-        try { payload=JSON.parse(Buffer.from(data).toString("utf8")); } catch { reconstruction("INVALID_CHECKPOINT","Invalid checkpoint JSON"); }
-        const integrity=payload.integrity as {algorithm?:string;digest?:string};const base={...payload};delete base.integrity;
-        if (payload.formatVersion!==2 || JSON.stringify(payload.identity)!==stateKey || integrity?.algorithm!=="sha256" || integrity.digest!==createHash("sha256").update(JSON.stringify(base)).digest("hex")) reconstruction("INVALID_CHECKPOINT","Pool checkpoint identity/version/integrity mismatch");
-        if (!Array.isArray(payload.events) || !Array.isArray(payload.trees)) reconstruction("INVALID_CHECKPOINT","Invalid pool checkpoint content");
-        try {
-          let previousSlot=-1;
-          for(const value of payload.events){const event=deserializeHistory(value);if(event.slot<previousSlot)reconstruction("INVALID_CHECKPOINT","Checkpoint event order mismatch");previousSlot=event.slot;applyPoolEvent(state,pool,this.programId,event);}
-          if(payload.trees.length!==state.generations.size)reconstruction("INVALID_CHECKPOINT","Checkpoint generations mismatch");
-          for (const value of payload.trees){const tree=deserializeTree(value);const replay=state.generations.get(tree.generation);if(!replay)reconstruction("INVALID_CHECKPOINT","Checkpoint unknown generation");compareTreeState(replay.tree,tree);}
-        } catch(error) { reconstruction("INVALID_CHECKPOINT",`Pool checkpoint replay failed: ${String(error)}`); }
-        const cursor=payload.cursor as {lastProcessedSignature?:unknown;lastFinalizedSlot?:unknown};
-        if ((cursor?.lastProcessedSignature===undefined)!==(cursor?.lastFinalizedSlot===undefined)) reconstruction("INVALID_CHECKPOINT","Checkpoint cursor incomplete");
-        if(cursor?.lastProcessedSignature!==undefined){if(typeof cursor.lastProcessedSignature!=="string")reconstruction("INVALID_CHECKPOINT","Invalid cursor signature");state.lastProcessedSignature=cursor.lastProcessedSignature;state.lastFinalizedSlot=parseSafeInteger(cursor.lastFinalizedSlot,"cursor slot");}
-      } else {
-        // Authenticate and validate v1 before discarding its tree-specific cursor.
-        // Rebuild the pool-global stream; never reinterpret old checkpoint bytes.
-        await this.loadCheckpoint(legacyIdentity,pool);
-      }
+    const identity = { genesisHash: await this.getGenesisIdentity(), programId: this.programId.toBase58(), pool: pool.toBase58(), stream: pda.shielded(pool, this.programId)[0].toBase58(), format: "pool-generations-v3" };
+    const key = this.storageKey(identity, "pool-manifest");
+    const cached = this.states.get(key);
+    const previous = await this.read(key);
+    let session: PoolReplayState;
+    if (previous) {
+      const manifest = this.manifest(previous, identity);
+      session = { manifest, manifestBytes: previous, active: cached?.manifestBytes && same(cached.manifestBytes, previous) ? cached.active : undefined };
+    } else {
+      // Explicit one-time migration: authenticate old formats, then recover
+      // from finalized RPC. Neither their cursors nor their trees become v3 state.
+      const legacyIdentity = await this.identity(pool, { ...current, generation: 0n });
+      const oldIdentity = { ...identity, format: "pool-generations-v2" };
+      const old = await this.poolCheckpointBytes(JSON.stringify(oldIdentity));
+      if (old) {
+        const value = checkedObject(old);
+        if (value.formatVersion !== 2 || JSON.stringify(value.identity) !== JSON.stringify(oldIdentity) || !Array.isArray(value.events) || !Array.isArray(value.trees)) reconstruction("INVALID_CHECKPOINT", "Invalid legacy v2 checkpoint");
+        for (const event of value.events) deserializeHistory(event);
+        for (const tree of value.trees) { const decoded = deserializeTree(tree); validateTreeShape(decoded, "legacy tree"); if (!decoded.pool.equals(pool)) reconstruction("INVALID_CHECKPOINT", "Legacy tree pool mismatch"); }
+      } else await this.loadCheckpoint(legacyIdentity, pool);
+      const active = this.initial(identity, current, 0n);
+      const base = await this.snapshot(identity, active, false);
+      session = { active, manifest: { formatVersion: 3, kind: "pool-manifest", identity, activeGeneration: "0", head: { base, segments: 0 }, summary: { nextIndex: "0", sequence: "0", root: hex(rootFromTree(active.tree)) }, cursor: {} } };
     }
-    const historyAddress=pda.shielded(pool,this.programId)[0];
-    const rows=await this.collectRows(historyAddress,state.lastProcessedSignature);
-    for(const row of rows){
-      const transaction=await this.transaction(row);
-      if(transaction.meta!.err === null && messageHasProgramInstruction(transaction,this.programId,historyAddress)){
-        for(const data of programEventLogs(transaction,this.programId)){
-          let event:HistoryEvent|undefined;
-          try{event=parseShieldedEvent(data,row.signature,row.slot);}catch(error){reconstruction("HISTORY_GAP",`Malformed finalized event in ${row.signature}: ${String(error)}`);}
-          if(event)applyPoolEvent(state,pool,this.programId,event);
+    const rows = await this.collectRows(new PublicKey(identity.stream), session.manifest.cursor.lastProcessedSignature);
+    if (!rows.length) {
+      if (BigInt(session.manifest.activeGeneration) !== current.generation) reconstruction("GENERATION_MISMATCH", "Finalized history is missing rollover");
+      this.compareSummary(session.manifest, current);
+      if (!previous) { const data = checkedBytes(session.manifest as unknown as Record<string, unknown>); await this.publish(key, previous, data); session.manifestBytes = data; }
+      this.states.set(key, session); return session;
+    }
+    session.active = cloneState(await this.activeState(session));
+    const pendingNullifiers = new Map<string, Uint8Array>();
+    let newRecords: AppendRecord[] = [];
+    const manifest = session.manifest;
+    for (const row of rows) {
+      const transaction = await this.transaction(row); this.metrics.historyTransactions++;
+      if (transaction.meta!.err === null && messageHasProgramInstruction(transaction, this.programId, new PublicKey(identity.stream))) {
+        const logs = programEventLogs(transaction, this.programId);
+        for (let offset = 0; offset < logs.length; offset++) {
+          let event: HistoryEvent | undefined;
+          try { event = parseShieldedEvent(logs[offset], row.signature, row.slot); }
+          catch { reconstruction("HISTORY_GAP", `Malformed finalized event in ${row.signature}`); }
+          if (!event) continue;
+          assertIdentity(pool, event);
+          const active = session.active!;
+          const generation = active.tree.generation;
+          if (event.kind === "rollover") {
+            if (event.previousGeneration !== generation || event.newGeneration !== generation + 1n || event.newGeneration > 0xffffffffffffffffn || !event.previousTree.equals(pda.tree(pool, generation, this.programId)[0]) || !event.newTree.equals(pda.tree(pool, event.newGeneration, this.programId)[0])) reconstruction("GENERATION_MISMATCH", "Impossible rollover identity/continuity");
+            if (TREE_CAPACITY - active.tree.nextIndex > 1n || !same(event.previousFinalRoot, rootFromTree(active.tree))) reconstruction("ROOT_MISMATCH", "Rollover final root/capacity mismatch");
+            compareTreeState(active.tree, await this.historicalTree(pool, generation));
+            const snapshot = await this.snapshot(identity, active, true);
+            if (await this.immutable(this.storageKey(identity, "sealed-generation", generation), checkedBytes({ formatVersion: 3, kind: "sealed-generation", identity: identityObject(active.identity), snapshot }))) this.metrics.sealedWrites++;
+            await this.flushNullifiers(manifest, pendingNullifiers);
+            session.active = this.initial(identity, current, event.newGeneration);
+            manifest.activeGeneration = event.newGeneration.toString();
+            manifest.head = { base: await this.snapshot(identity, session.active, false), segments: 0 };
+            newRecords = [];
+          } else if (event.kind === "shield") {
+            if (event.generation !== generation) reconstruction("GENERATION_MISMATCH", "Cannot append to a sealed generation");
+            applyEvent(active, pool, event);
+            newRecords.push(active.appends.get(event.index)!); this.metrics.replayedAppends++;
+          } else {
+            if (event.generation > generation) reconstruction("GENERATION_MISMATCH", "Input generation has not been initialized");
+            const input = event.generation === generation ? active.tree : await this.historicalTree(pool, event.generation);
+            assertAcceptedRoot(input, event.rootSequence, event.kind === "swap" ? event.root : undefined);
+            await this.nullifier(identity, event, offset, pendingNullifiers);
+            if (event.kind === "swap") {
+              if (event.outputGeneration !== generation) reconstruction("GENERATION_MISMATCH", "Cannot append swap outputs to a sealed generation");
+              const index = active.tree.nextIndex;
+              if (event.changeIndex !== undefined && event.changeIndex !== index || event.outputIndex !== index + (event.changeIndex === undefined ? 0n : 1n)) reconstruction("SEQUENCE_GAP", "Swap output indices are not contiguous");
+              if (event.changeIndex !== undefined) { appendRecord(active, appendLeaf(active.tree, event.changeCommitment), event.changeCommitment, event); newRecords.push(active.appends.get(event.changeIndex)!); this.metrics.replayedAppends++; }
+              appendRecord(active, appendLeaf(active.tree, event.outputCommitment), event.outputCommitment, event); newRecords.push(active.appends.get(event.outputIndex)!); this.metrics.replayedAppends++;
+            }
+          }
         }
       }
-      state.lastProcessedSignature=row.signature;state.lastFinalizedSlot=row.slot;
+      manifest.cursor = { lastProcessedSignature: row.signature, lastFinalizedSlot: row.slot };
     }
-    if(state.activeGeneration!==current.generation)reconstruction("GENERATION_MISMATCH","History is missing a rollover or active tree changed during sync; retry");
-    for(const [g,s] of state.generations){compareTreeState(s.tree,g===current.generation?current:await this.historicalTree(pool,g));}
-    if(this.checkpointStore&&(rows.length||!this.states.has(stateKey)))await this.savePoolCheckpoint(stateKey,serializePoolCheckpoint(state,identity));
-    this.states.set(stateKey,state);return state;
+    const active = session.active!;
+    if (active.tree.generation !== current.generation) reconstruction("GENERATION_MISMATCH", "Active generation disagrees with finalized history");
+    compareTreeState(active.tree, current); completeGeneration(active);
+    if (newRecords.length) {
+      if (manifest.head.segments >= MAX_SEGMENTS) manifest.head = { base: await this.snapshot(identity, active, false), segments: 0 };
+      else {
+        this.metrics.serializedAppends += newRecords.length;
+        const tail = await this.putBlob(identity, active.tree.generation, checkedBytes({ formatVersion: 3, kind: "generation-delta", identity: identityObject(active.identity), baseDigest: manifest.head.base.digest,
+          previous: manifest.head.tail, appends: newRecords.map(recordObject), tree: serializeTree(active.tree) }));
+        manifest.head = { ...manifest.head, tail, segments: manifest.head.segments + 1 }; this.metrics.activeDeltaWrites++;
+      }
+    }
+    await this.flushNullifiers(manifest, pendingNullifiers);
+    manifest.summary = { nextIndex: active.tree.nextIndex.toString(), sequence: active.tree.sequence.toString(), root: hex(rootFromTree(active.tree)) };
+    const data = checkedBytes(manifest as unknown as Record<string, unknown>);
+    await this.publish(key, previous, data);
+    session.manifestBytes = data; this.states.set(key, session);
+    if (!this.checkpointStore) {
+      for (const storedKey of this.blobs.keys()) {
+        const scope = JSON.parse(storedKey) as { identity?: unknown; generation?: string };
+        if (JSON.stringify(scope.identity) === JSON.stringify(identity) && scope.generation !== undefined && BigInt(scope.generation) < active.tree.generation) this.blobs.delete(storedKey);
+      }
+    }
+    return session;
   }
 
   private async load(pool: PublicKey): Promise<PoolReplayState> {
@@ -980,22 +1286,54 @@ export class RpcMerkleWitnessProvider implements MerkleWitnessProvider {
   }
 
   async getShieldEvents(pool: PublicKey): Promise<ShieldAppendEvent[]> {
-    const state = await this.load(pool);
-    return [...state.generations.values()].flatMap(s=>[...s.appends.values()]).filter(record => record.event.kind === "shield").map(record => cloneEvent(record.event) as ShieldAppendEvent);
+    const session = await this.load(pool);
+    const result: ShieldAppendEvent[] = [];
+    for (let generation = 0n; generation <= BigInt(session.manifest.activeGeneration); generation++) {
+      const state = generation === BigInt(session.manifest.activeGeneration) ? await this.activeState(session) : await this.sealedGeneration(session.manifest.identity, generation);
+      for (const record of state.appends.values()) if (record.event.kind === "shield") result.push(cloneEvent(record.event) as ShieldAppendEvent);
+    }
+    return result;
   }
 
   async getSpentNullifiers(pool: PublicKey): Promise<Uint8Array[]> {
-    const state = await this.load(pool);
-    return [...state.spentNullifiers].map(bytes);
+    // Explicit exhaustive API: normal witness requests never enumerate this log.
+    const session = await this.load(pool);
+    const identity = session.manifest.identity;
+    const nullifiers = new Set<string>(); const seen = new Set<string>();
+    let head = session.manifest.nullifierHead;
+    while (head) {
+      if (seen.has(head.digest)) reconstruction("INVALID_CHECKPOINT", "Cyclic nullifier journal");
+      seen.add(head.digest);
+      const value = checkedObject(await this.readBlob(identity, undefined, head));
+      if (value.formatVersion !== 3 || value.kind !== "nullifier-segment" || JSON.stringify(value.identity) !== JSON.stringify(identity) || !Array.isArray(value.entries) || value.entries.length > 4096) reconstruction("INVALID_CHECKPOINT", "Invalid nullifier journal segment");
+      for (const entry of value.entries as Array<{ nullifier: string; digest: string }>) {
+        const nf = parseBytes(entry.nullifier, 32, "nullifier");
+        if (!canonicalField(nf) || nullifiers.has(entry.nullifier)) reconstruction("INVALID_CHECKPOINT", "Invalid/duplicate committed nullifier");
+        const record = await this.read(this.storageKey(identity, "nullifier-index", undefined, entry.nullifier));
+        if (!record || digest(record) !== entry.digest) reconstruction("INVALID_CHECKPOINT", "Committed nullifier index is missing/corrupt");
+        nullifiers.add(entry.nullifier);
+      }
+      head = value.previous === undefined ? undefined : reference(value.previous);
+    }
+    return [...nullifiers].map(bytes);
   }
 
   async getWitness(pool: PublicKey, commitment: Uint8Array, generation?: bigint): Promise<MerkleWitness> {
-    const replay = await this.load(pool);
-    const matches=[...replay.generations.values()].filter(state=>generation===undefined||state.tree.generation===generation).flatMap(state=>[...state.appends.values()].filter(record=>same(record.commitment,commitment)).map(leaf=>({state,leaf})));
-    const state=matches[0]?.state;
-    const leaf=matches[0]?.leaf;
+    const session = await this.load(pool);
+    const activeGeneration = BigInt(session.manifest.activeGeneration);
+    if (generation !== undefined && (generation < 0n || generation > activeGeneration)) reconstruction("GENERATION_MISMATCH", "Requested generation is not initialized");
+    let state: ReplayState | undefined; let leaf: AppendRecord | undefined;
+    // The optional legacy search is deliberately exhaustive. Wallets pass the
+    // note generation, so their normal path loads only that leaf set (plus any
+    // active state needed to apply a new finalized suffix).
+    for (let g = generation ?? 0n; g <= (generation ?? activeGeneration); g++) {
+      const candidate = g === activeGeneration ? await this.activeState(session) : await this.sealedGeneration(session.manifest.identity, g);
+      leaf = [...candidate.appends.values()].find(record => same(record.commitment, commitment));
+      if (leaf) { state = candidate; break; }
+    }
     if (!leaf) throw new Error("Note commitment is not present in the reconstructed tree");
     const current=state!.tree;
+    compareTreeState(current, current.generation === activeGeneration ? await this.getTree(pool) : await this.historicalTree(pool, current.generation));
     let levelNodes = new Map<bigint, Uint8Array>([...state!.appends.values()].map(record => [record.index, record.commitment]));
     const siblings: Uint8Array[] = [];
     let nodeIndex = leaf.index;

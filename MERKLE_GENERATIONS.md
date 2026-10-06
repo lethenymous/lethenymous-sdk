@@ -60,24 +60,16 @@ journal framing/version/key derivation is preserved; optional generation is
 serialized as a decimal string. Existing encrypted note and pending-operation
 data is not destroyed or reinterpreted.
 
-Pool checkpoint payload version is **2**. It records all replay events,
-generation snapshots, pool/chain/program identity and a finalized stream cursor.
-Small payloads are stored directly; large ones are split into authenticated
-content-addressed 8 MiB chunks before atomically switching the manifest. This
-avoids the encrypted store's 64 MiB per-checkpoint boundary. Each chunk and the
-assembled payload are integrity checked; the underlying checkpoint store must
-authenticate bytes and perform crash-safe writes. The supplied encrypted store
-uses AEAD. SHA-256 alone is an integrity check, not authentication against a
-malicious writer.
-
-A v1 checkpoint is authenticated and validated, then rebuilt from finalized
-pool-global history rather than reusing its old tree-specific cursor. Invalid
-bytes fail closed. User NoteStore data is preserved. Restart replays the
-authenticated checkpoint and fetches only the finalized suffix. Old chunk
-garbage collection is future housekeeping; replay still uses memory proportional
-to total history. Very large pools require provisioning accordingly or an
-application-provided persistent/indexed witness provider. The protocol itself
-does not impose an active-generation cutoff on old notes.
+Checkpoint payload version is now **3**. A small pool manifest resumes the finalized
+stream and points to an active base/delta chain; sealed generation snapshots are
+immutable and loaded lazily. Nullifiers have a separate uncompressed direct index
+and journal. No lifetime event list is retained in the pool checkpoint. v1/v2
+checkpoints are authenticated as their original format and explicitly rebuilt,
+not silently reinterpreted. NoteStore content is preserved. See
+[CHECKPOINT_SCALABILITY.md](CHECKPOINT_SCALABILITY.md) for publication, migration,
+complexity, instrumentation and validation details. Archive disk usage and orphan
+garbage collection remain operational concerns. The protocol does not impose an
+active-generation cutoff on old notes.
 
 ## Fee and packet size
 

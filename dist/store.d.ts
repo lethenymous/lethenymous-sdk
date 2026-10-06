@@ -35,5 +35,8 @@ export declare class EncryptedFileNoteStore implements JournaledNoteStore, Merkl
     importBackup(backup: Uint8Array): Promise<void>;
     private checkpointPath;
     loadMerkleCheckpoint(identity: string): Promise<Uint8Array | undefined>;
+    private readCheckpoint;
     saveMerkleCheckpoint(identity: string, checkpoint: Uint8Array): Promise<void>;
+    compareAndSwapMerkleCheckpoint(identity: string, expectedDigest: string | undefined, checkpoint: Uint8Array): Promise<boolean>;
+    private writeCheckpoint;
 }

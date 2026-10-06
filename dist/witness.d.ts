@@ -62,6 +62,19 @@ export declare class MerkleReconstructionError extends Error {
     readonly code: MerkleReconstructionErrorCode;
     constructor(code: MerkleReconstructionErrorCode, message: string);
 }
+export interface MerkleReplayMetrics {
+    generationLoads: number;
+    validatedLeaves: number;
+    replayedAppends: number;
+    serializedAppends: number;
+    sealedWrites: number;
+    activeDeltaWrites: number;
+    manifestWrites: number;
+    historyTransactions: number;
+    nullifierReads: number;
+    nullifierWrites: number;
+    serializedBytes: number;
+}
 export declare function parseShieldedEvent(data: Buffer, signature: string, slot: number): HistoryEvent | undefined;
 export declare class RpcMerkleWitnessProvider implements MerkleWitnessProvider {
     private readonly connection;
@@ -72,6 +85,10 @@ export declare class RpcMerkleWitnessProvider implements MerkleWitnessProvider {
     private readonly states;
     private readonly syncing;
     private genesisHash?;
+    private readonly blobs;
+    private readonly historical;
+    private readonly metrics;
+    getReplayMetrics(): MerkleReplayMetrics;
     constructor(connection: Connection, programId: PublicKey, getTree: (pool: PublicKey) => Promise<TreeState>, checkpointStore?: MerkleCheckpointStore | undefined, getGenerationTree?: ((pool: PublicKey, generation: bigint) => Promise<TreeState>) | undefined);
     private getGenesisIdentity;
     private identity;
@@ -80,7 +97,24 @@ export declare class RpcMerkleWitnessProvider implements MerkleWitnessProvider {
     private transaction;
     private historicalTree;
     private poolCheckpointBytes;
-    private savePoolCheckpoint;
+    private storageKey;
+    private read;
+    private immutable;
+    private putBlob;
+    private readBlob;
+    private generationIdentity;
+    private initial;
+    private assertGenerationObject;
+    private snapshot;
+    private loadGeneration;
+    private sealedGeneration;
+    private recoverVolatileGeneration;
+    private publish;
+    private manifest;
+    private compareSummary;
+    private activeState;
+    private nullifier;
+    private flushNullifiers;
     private syncPool;
     private load;
     getShieldEvents(pool: PublicKey): Promise<ShieldAppendEvent[]>;

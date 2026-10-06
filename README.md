@@ -2,6 +2,10 @@
 
 ## Feature-branch generation update
 
+The SDK checkpoint remediation is documented in
+[CHECKPOINT_SCALABILITY.md](CHECKPOINT_SCALABILITY.md). It replaces lifetime v2
+event replay with generation-scoped v3 persistence and remains pending source review.
+
 See [MERKLE_GENERATIONS.md](MERKLE_GENERATIONS.md) for the new generation-aware
 program ABI, 5-bps extra shield fee, history/checkpoint migration, and local
 validation. These branch changes have not been deployed or published and are

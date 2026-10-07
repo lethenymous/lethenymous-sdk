@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 import { xchacha20poly1305 } from "@noble/ciphers/chacha.js";
 import { PublicKey } from "@solana/web3.js";
 import { noteCommitment, noteStoreKey } from "./crypto.js";
+import { canonicalNoteState as noteState } from "./note-state.js";
 const MAGIC = Buffer.from("LNSJ");
 const FORMAT_VERSION = 1;
 const AAD_PREFIX = Buffer.from("zkcpmm-v2/note-store/v1");
@@ -22,6 +23,8 @@ const idOf = (value) => hex(value);
 function cloneNote(note) {
     return {
         ...note,
+        state: noteState(note),
+        spent: noteState(note) === "spent",
         generation: note.generation ?? 0n,
         ownerCommitment: Uint8Array.from(note.ownerCommitment),
         randomness: Uint8Array.from(note.randomness),
@@ -29,11 +32,6 @@ function cloneNote(note) {
         encryptedPayload: cloneBytes(note.encryptedPayload),
         operationId: cloneBytes(note.operationId),
     };
-}
-function noteState(note) {
-    if (note.state)
-        return note.state;
-    return note.spent ? "spent" : "available";
 }
 function serializeNote(note) {
     return {
@@ -62,10 +60,12 @@ function deserializeNote(value) {
         encryptedPayload: typeof value.encryptedPayload === "string" ? bytes(value.encryptedPayload) : undefined,
         leafIndex: value.leafIndex === undefined ? undefined : BigInt(String(value.leafIndex)),
         generation: value.generation === undefined ? 0n : BigInt(String(value.generation)),
-        state: String(value.state),
+        state: value.state === undefined ? undefined : String(value.state),
+        spent: value.spent === true,
         operationId: typeof value.operationId === "string" ? bytes(value.operationId) : undefined,
         transactionSignature: typeof value.transactionSignature === "string" ? value.transactionSignature : undefined,
     };
+    note.state = noteState(note);
     note.spent = note.state === "spent";
     return note;
 }

@@ -41,6 +41,7 @@ export declare class ShieldedWallet {
     private begin;
     private reserveAndBegin;
     private fail;
+    private inputConsumed;
     private unknown;
     private submitted;
     private finalized;

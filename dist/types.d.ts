@@ -114,7 +114,7 @@ export interface NoteStore {
     releaseReservation(commitment: Uint8Array, operationId?: Uint8Array): Promise<void>;
 }
 export type OperationKind = "shield" | "unshield" | "private_swap";
-export type OperationState = "intent" | "prepared" | "submitted" | "finalized" | "failed" | "unknown";
+export type OperationState = "intent" | "proving" | "prepared" | "submitted" | "finalized" | "failed" | "unknown";
 export interface OperationRecord {
     id: Uint8Array;
     kind: OperationKind;

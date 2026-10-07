@@ -7,13 +7,15 @@ import { shieldFee, swapOutputPreservingLpClaims } from "./math.js";
 import { pda } from "./pda.js";
 import { OnChainPagedMerkleWitnessProvider } from "./archive.js";
 import { readCanonicalSpentStates } from "./spent.js";
+import { canonicalNoteState as state } from "./note-state.js";
 import type { JournaledNoteStore, MerkleWitnessProvider, Note, NoteStore, OperationRecord, Prover, ShieldParams } from "./types.js";
 import { transactionSignatureFromBytes, type Lethenymous } from "./client.js";
 
 const key = (value: Uint8Array) => Buffer.from(value).toString("hex");
-const clone = (note: Note): Note => ({ ...note, generation: note.generation ?? 0n, ownerCommitment: Uint8Array.from(note.ownerCommitment), randomness: Uint8Array.from(note.randomness), commitment: Uint8Array.from(note.commitment), encryptedPayload: note.encryptedPayload && Uint8Array.from(note.encryptedPayload), operationId: note.operationId && Uint8Array.from(note.operationId) });
-const state = (note: Note) => note.state ?? (note.spent ? "spent" : "available");
+const clone = (note: Note): Note => ({ ...note, state: state(note), spent: state(note) === "spent", generation: note.generation ?? 0n, ownerCommitment: Uint8Array.from(note.ownerCommitment), randomness: Uint8Array.from(note.randomness), commitment: Uint8Array.from(note.commitment), encryptedPayload: note.encryptedPayload && Uint8Array.from(note.encryptedPayload), operationId: note.operationId && Uint8Array.from(note.operationId) });
 const same = (a: Uint8Array, b: Uint8Array) => Buffer.from(a).equals(Buffer.from(b));
+// Shared across wallet instances: reconciliation cannot abandon a live owner.
+const activeOperations = new Set<string>();
 const noteFingerprint = (note: Note) => JSON.stringify({ pool: note.pool.toBase58(), asset: note.asset.toBase58(), amount: note.amount.toString(), generation: (note.generation ?? 0n).toString(), ownerCommitment: key(note.ownerCommitment), randomness: key(note.randomness), commitment: key(note.commitment), encryptedPayload: note.encryptedPayload && key(note.encryptedPayload), leafIndex: note.leafIndex?.toString(), state: state(note), operationId: note.operationId && key(note.operationId), transactionSignature: note.transactionSignature });
 
 export class InMemoryNoteStore implements JournaledNoteStore {
@@ -25,7 +27,7 @@ export class InMemoryNoteStore implements JournaledNoteStore {
   }
 
   async saveNote(input: Note): Promise<void> {
-    const note = clone({ ...input, state: input.state ?? "available", spent: input.state === "spent" || input.spent === true });
+    const note = clone({ ...input, state: state(input), spent: state(input) === "spent" });
     const existing = this.notes.get(key(note.commitment));
     if (existing && noteFingerprint(existing) !== noteFingerprint(note)) throw new Error("Conflicting duplicate note commitment");
     if (!existing) this.notes.set(key(note.commitment), note);
@@ -144,17 +146,38 @@ export class ShieldedWallet {
   private async begin(operation: OperationRecord): Promise<void> {
     const journal = this.journal();
     if (journal) await journal.beginOperation(operation);
+    activeOperations.add(key(operation.id));
   }
 
   private async reserveAndBegin(note: Note, operation: OperationRecord): Promise<Note> {
     const journal = this.journal();
-    if (journal) return journal.reserveNoteAndBegin(note.commitment, operation.id, this.ownerCommitment, operation);
-    await this.store.reserveNote(note.commitment, operation.id, this.ownerCommitment);
-    return note;
+    activeOperations.add(key(operation.id));
+    try {
+      return journal ? await journal.reserveNoteAndBegin(note.commitment, operation.id, this.ownerCommitment, operation) : await this.store.reserveNote(note.commitment, operation.id, this.ownerCommitment);
+    } catch (error) { activeOperations.delete(key(operation.id)); throw error; }
   }
 
   private async fail(operationId: Uint8Array, note?: Note, reason?: string, journaled = true): Promise<void> {
-    try { if (note) await this.store.releaseReservation(note.commitment, operationId); } finally { const journal = this.journal(); if (journal && journaled) await journal.markOperationFailed(operationId, reason ?? "operation failed"); }
+    const journal = this.journal();
+    const operation = journal && journaled ? (await journal.getPendingOperations()).find(o => same(o.id, operationId)) : undefined;
+    if (journal && journaled && !operation) return;
+    if (operation?.metadata.finalizedSuccess === "true") { await this.unknown(operationId, "Finalized success persistence pending"); return; }
+    if (note) {
+      try {
+        if (await this.inputConsumed(note)) {
+          await this.store.markSpent(note.commitment, operationId);
+          if (operation?.kind === "private_swap") { await this.unknown(operationId, "Consumed input requires output reconciliation"); return; }
+          if (journal && journaled) await journal.markOperationFinalized(operationId);
+          return;
+        } else await this.store.releaseReservation(note.commitment, operationId);
+      } catch { await this.unknown(operationId, "Canonical input state or persistence is unavailable"); return; }
+    }
+    if (journal && journaled) await journal.markOperationFailed(operationId, reason ?? "operation failed");
+  }
+
+  private async inputConsumed(note: Note): Promise<boolean> {
+    if (state(note) === "spent") return true;
+    return (await readCanonicalSpentStates(this.sdk.connection, this.sdk.programId, note.pool, [nullifier(note.pool, note.asset, this.spendSecret, note.randomness)]))[0];
   }
 
   private async unknown(operationId: Uint8Array, reason: string, signature?: string): Promise<void> {
@@ -175,9 +198,10 @@ export class ShieldedWallet {
   }
 
   private async finalized(operationId: Uint8Array, note?: Note, outputNotes: Note[] = []): Promise<void> {
+    const journal = this.journal();
+    if (journal) await journal.updateOperation(operationId, { metadata: { finalizedSuccess: "true" } });
     if (note) await this.store.markSpent(note.commitment, operationId);
     for (const output of outputNotes) await this.store.saveNote(output);
-    const journal = this.journal();
     if (journal) await journal.markOperationFinalized(operationId);
   }
 
@@ -202,8 +226,10 @@ export class ShieldedWallet {
 
   private async finalizeAppend(operationId: Uint8Array, kind: "shield" | "private_swap", pool: PublicKey, signature: string, outputs: Note[], input?: Note, nullifier?: string): Promise<void> {
     try {
+      const journal = this.journal();
+      if (journal) await journal.updateOperation(operationId, { metadata: { finalizedSuccess: "true", signature } });
       await this.locateOutputs(kind, pool, signature, outputs, nullifier);
-      const journal = this.journal(); if (journal) await journal.updateOperation(operationId, { outputNotes: outputs });
+      if (journal) await journal.updateOperation(operationId, { outputNotes: outputs });
       await this.finalized(operationId, input, outputs);
     } catch {
       await this.unknown(operationId, "Finalized transaction requires authenticated note-location recovery", signature);
@@ -242,6 +268,8 @@ export class ShieldedWallet {
     } catch (error) {
       if (!String(error).includes("outcome is unknown") && !String(error).includes("TransactionUnknownError")) await this.fail(operationId, undefined, String(error));
       throw error;
+    } finally {
+      activeOperations.delete(key(operationId));
     }
   }
 
@@ -254,7 +282,7 @@ export class ShieldedWallet {
     let reserved = false;
     try {
       if (note.amount !== input.amount) throw new Error("Unshield consumes a complete note; partial unshield is not supported");
-      note = await this.reserveAndBegin(note, { id: operationId, kind: "unshield", state: "intent", pool: input.pool, inputCommitment: note.commitment, metadata: { asset: input.mint.toBase58(), amount: input.amount.toString(), recipient: input.recipient.toBase58() }, outputNotes: [] });
+      note = await this.reserveAndBegin(note, { id: operationId, kind: "unshield", state: "proving", pool: input.pool, inputCommitment: note.commitment, metadata: { asset: input.mint.toBase58(), amount: input.amount.toString(), recipient: input.recipient.toBase58() }, outputNotes: [] });
       journaled = true;
       reserved = true;
       const pool = await this.sdk.getPool(input.pool);
@@ -282,12 +310,18 @@ export class ShieldedWallet {
         onPrepared: async (transaction, lastValidBlockHeight) => { const journal = this.journal(); if (journal) await journal.markPrepared(operationId, transaction, lastValidBlockHeight); },
         onSubmitted: async signature => this.submitted(operationId, signature, note),
       });
-      if (outcome.status === "finalized-success") { await this.finalized(operationId, note); return outcome.signature; }
+      if (outcome.status === "finalized-success") {
+        try { await this.finalized(operationId, note); }
+        catch { await this.unknown(operationId, "Finalized success persistence pending", outcome.signature); throw new Error("Operation outcome is unknown: finalized success persistence pending"); }
+        return outcome.signature;
+      }
       if (outcome.status === "finalized-failed") { await this.fail(operationId, note, String(outcome.error), journaled); throw new Error(`Unshield transaction failed: ${String(outcome.error)}`); }
       await this.unknown(operationId, outcome.reason, outcome.signature); throw new Error(`Unshield transaction outcome is unknown: ${outcome.reason}`);
     } catch (error) {
       if (!String(error).includes("outcome is unknown") && !String(error).includes("TransactionUnknownError")) await this.fail(operationId, reserved ? note : undefined, String(error), journaled);
       throw error;
+    } finally {
+      activeOperations.delete(key(operationId));
     }
   }
 
@@ -304,7 +338,7 @@ export class ShieldedWallet {
     let reserved = false;
     try {
       if (input.amountIn > note.amount) throw new Error("Insufficient private balance");
-      note = await this.reserveAndBegin(note, { id: operationId, kind: "private_swap", state: "intent", pool: input.pool, inputCommitment: note.commitment, metadata: { assetIn: input.inputMint.toBase58(), assetOut: input.outputMint.toBase58(), amountIn: input.amountIn.toString() }, outputNotes: [] });
+      note = await this.reserveAndBegin(note, { id: operationId, kind: "private_swap", state: "proving", pool: input.pool, inputCommitment: note.commitment, metadata: { assetIn: input.inputMint.toBase58(), assetOut: input.outputMint.toBase58(), amountIn: input.amountIn.toString() }, outputNotes: [] });
       journaled = true;
       reserved = true;
       const pool = await this.sdk.getPool(input.pool);
@@ -360,6 +394,8 @@ export class ShieldedWallet {
     } catch (error) {
       if (!String(error).includes("outcome is unknown") && !String(error).includes("TransactionUnknownError")) await this.fail(operationId, reserved ? note : undefined, String(error), journaled);
       throw error;
+    } finally {
+      activeOperations.delete(key(operationId));
     }
   }
 
@@ -452,7 +488,7 @@ export class ShieldedWallet {
       note.state = consumed ? "spent" : "available"; note.spent = !!consumed;
     }
     const journal = this.journal()!;
-    await journal.updateOperation(operation.id, { outputNotes: outputs });
+    await journal.updateOperation(operation.id, { outputNotes: outputs, metadata: { finalizedSuccess: "true" } });
     if (operation.inputCommitment) await this.store.markSpent(operation.inputCommitment, operation.id);
     for (const output of outputs) {
       const current = (await this.getNotes()).find(n => same(n.commitment, output.commitment));
@@ -472,11 +508,27 @@ export class ShieldedWallet {
     if (!journal) return [];
     const pending = await journal.getPendingOperations();
     for (const operation of pending) {
+      if (activeOperations.has(key(operation.id))) continue;
+      if (operation.kind === "unshield" && operation.inputCommitment) {
+        const input = (await this.getNotes()).find(n => same(n.commitment, operation.inputCommitment!));
+        try {
+          if (!input) throw new Error("Missing spend input");
+          if (operation.metadata.finalizedSuccess === "true" || await this.inputConsumed(input)) {
+            await this.finalized(operation.id, input);
+            continue;
+          }
+        } catch { await this.unknown(operation.id, "Canonical input state or publication is unavailable"); continue; }
+      }
       const signature = operation.signature ?? operation.metadata.signature ?? (operation.signedTransaction ? transactionSignatureFromBytes(operation.signedTransaction) : undefined);
       if (!signature) {
+        // A proving owner may live in another process. No timeout proves abandonment.
+        if (operation.state === "proving") continue;
         if (operation.state === "intent") {
           if (operation.inputCommitment) {
-            try { await this.store.releaseReservation(operation.inputCommitment, operation.id); } catch { /* The composite reservation may not have committed. */ }
+            const input = (await this.getNotes()).find(n => same(n.commitment, operation.inputCommitment!));
+            if (!input) continue;
+            await this.fail(operation.id, input, "Operation had no submitted transaction signature");
+            continue;
           }
           try { await journal.markOperationFailed(operation.id, "Operation had no submitted transaction signature"); } catch { /* Retry on the next reconciliation pass. */ }
         }
@@ -508,12 +560,16 @@ export class ShieldedWallet {
           catch { await journal.markOperationUnknown(operation.id, "Authenticated finalized note locations/spent state are unavailable"); }
           continue;
         }
-        if (operation.inputCommitment) await this.store.markSpent(operation.inputCommitment, operation.id);
-        for (const note of operation.outputNotes) await this.store.saveNote(note);
-        await journal.markOperationFinalized(operation.id);
+        const input = (await this.getNotes()).find(n => operation.inputCommitment && same(n.commitment, operation.inputCommitment));
+        try { await this.finalized(operation.id, input, operation.outputNotes); }
+        catch { await this.unknown(operation.id, "Finalized success persistence pending", signature); }
       } else if (outcome.status === "finalized-failed") {
-        if (operation.inputCommitment) await this.store.releaseReservation(operation.inputCommitment, operation.id);
-        await journal.markOperationFailed(operation.id, String(outcome.error));
+        if (operation.metadata.finalizedSuccess === "true") {
+          await journal.markOperationUnknown(operation.id, "Finalized success requires output publication");
+          continue;
+        }
+        const input = (await this.getNotes()).find(n => operation.inputCommitment && same(n.commitment, operation.inputCommitment));
+        await this.fail(operation.id, input, String(outcome.error));
       } else {
         await journal.markOperationUnknown(operation.id, outcome.reason);
       }

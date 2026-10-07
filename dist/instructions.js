@@ -24,7 +24,7 @@ export function initializePool(payer, authority, creator, a, b, feeBps, programI
         throw new Error("Mints must be ordered");
     const [pool] = pda.pool(a, b, feeBps, programId);
     return ix("initialize_pool", u16(feeBps), [
-        signer(payer), signer(authority), ro(creator), ro(a), ro(b), rw(pool),
+        signer(payer), meta(authority, true), ro(creator), ro(a), ro(b), rw(pool),
         rw(pda.vaultA(pool, programId)[0]), rw(pda.vaultB(pool, programId)[0]),
         rw(pda.protocolFeeA(pool, programId)[0]), rw(pda.protocolFeeB(pool, programId)[0]),
         rw(pda.creatorFeeA(pool, programId)[0]), rw(pda.creatorFeeB(pool, programId)[0]),
@@ -52,7 +52,7 @@ export function addLiquidity(provider, pool, providerA, providerB, providerLp, a
 export function shield(depositor, pool, state, asset, amount, owner, randomness, encrypted, depositorA, depositorB, programId = PROGRAM_ID, archive) {
     const target = archiveContext(pool, state, archive, programId);
     return ix("shield", concat(enumByte(asset), u64(amount), bytes32(owner), bytes32(randomness), vec(encrypted)), [
-        signer(depositor), ro(pool.address), rw(pda.shielded(pool.address, programId)[0]), rw(state.tree),
+        signer(depositor), ro(pool.address), ro(pda.shielded(pool.address, programId)[0]), rw(state.tree),
         ro(pool.tokenAMint), ro(pool.tokenBMint), rw(state.custodyA), rw(state.custodyB),
         rw(depositorA), rw(depositorB), rw(asset === 0 ? pool.protocolFeeVaultA : pool.protocolFeeVaultB), ro(TOKEN_PROGRAM_ID),
         rw(pda.pageDirectory(pool.address, target.generation, programId)[0]), rw(pda.leafPage(pool.address, target.generation, Number(target.nextIndex >> 12n), programId)[0]), ro(SystemProgram.programId),

@@ -1,35 +1,37 @@
 # @lethenymous/sdk
 
-## Feature-branch generation update
+## Release status
 
-The SDK-only REAUD-01 fix validates every recovered output's own canonical
-finalized spent state before publication. Consumed notes stay consumed across
-restarts and never enter spendable balance. See
-[REAUD_SPENT_OUTPUT_RECOVERY.md](REAUD_SPENT_OUTPUT_RECOVERY.md) for mixed-state,
-restart, strict-account and genuine SBF reproduction evidence. Pending focused
-independent re-test.
+SDK release source: `1939d5104901c7a18a653c60893b96c416736faa` plus release-only
+version metadata for `0.1.1`. The paired Core source is
+`cde3018f4ab5f29c30df0442ffb2812dabfc6c8f`, deployed under Program ID
+`ZkCP47fAJJREdXNKSBvTsgJAuLoTKepgk6opmqsHobm` with frozen SBF SHA-256
+`bb70f41d59660c2f66378f7124ba068a83911746698fbab26236a1e2d447d87b`.
 
-The defensive-audit remediation is documented in
-[PAGED_MERKLE_AUDIT_REMEDIATION.md](PAGED_MERKLE_AUDIT_REMEDIATION.md): account-only
-pending-output reconciliation, directory-v2 parsing and priority-fee packet
-regressions, paired with prefunding-safe nullifiers and bounded core compute.
-Pending independent re-audit.
+Fresh Devnet release-gate validation **passed** for Shield, production-proof
+private swaps in both directions, Private Send, Unshield, replay rejection,
+account-only witness recovery and spend, canonical spent-state restart, and an
+organic two-output 4095→4096 cross-page swap. The full details and scope limits
+are in Core's
+[`release/DEVNET_VALIDATION_2026-10-07.md`](https://github.com/lethenymous/zkcpmm/blob/main/release/DEVNET_VALIDATION_2026-10-07.md).
+Gen0→Gen1 rollover scale stress was not executed on Devnet; no Devnet Gen1
+success is claimed. It is documented as a quantified scale-stress coverage
+limitation, not a demonstrated protocol defect.
 
-The default witness provider now reconstructs depth-16 membership using only
-finalized canonical on-chain page accounts. See
-[ONCHAIN_MERKLE_ARCHIVE.md](ONCHAIN_MERKLE_ARCHIVE.md) for the paired program ABI,
-encrypted output-index persistence, account-only production-proof tests and
-measured packet/CU/rent costs.
+Historical v0.1.0 audit reports describe earlier implementations. The current
+security and operational assumptions are summarized in the release and
+remediation notes below; historical audit status is not current release
+evidence.
 
-The SDK checkpoint remediation is documented in
-[CHECKPOINT_SCALABILITY.md](CHECKPOINT_SCALABILITY.md). It replaces lifetime v2
-event replay with generation-scoped v3 persistence and remains pending source review.
-
-See [MERKLE_GENERATIONS.md](MERKLE_GENERATIONS.md) for the new generation-aware
-program ABI, 5-bps extra shield fee, history/checkpoint migration, and local
-validation. These branch changes have not been deployed or published and are
-pending independent source review and devnet adversarial validation. Historical
-v0.1.0 audit reports describe the earlier implementation.
+The account-only paged witness provider and archive ABI are documented in
+[ONCHAIN_MERKLE_ARCHIVE.md](ONCHAIN_MERKLE_ARCHIVE.md). Generation-aware state
+and checkpoint migration are documented in
+[MERKLE_GENERATIONS.md](MERKLE_GENERATIONS.md) and
+[CHECKPOINT_SCALABILITY.md](CHECKPOINT_SCALABILITY.md). Wallet restart and
+canonical spent-output behavior are documented in
+[REAUD_SPENT_OUTPUT_RECOVERY.md](REAUD_SPENT_OUTPUT_RECOVERY.md), with
+[PAGED_MERKLE_AUDIT_REMEDIATION.md](PAGED_MERKLE_AUDIT_REMEDIATION.md) covering
+the paired runtime remediation.
 
 TypeScript protocol client for the frozen Lethenymous / zkCPMM program.
 
@@ -157,14 +159,13 @@ Unshield and private swap require a validated v0 address lookup table and a
 wallet adapter implementing `signVersionedTransaction`. If the requirement is
 not met, the SDK throws `LookupTableRequiredError` before proving or signing.
 
-For the audited Devnet fixture, configure
-`FMVUyVx6byt3dVV7nmkbXbsu5fLQPM8gTdJwN5YYL9HC` with its frozen address list
-and authority, as `e2e/fixture.mjs` does. That table places the stable
-shielded-state, tree, custody, mint, token-program, and system accounts in the
-LUT while recipient and recipient-ATA accounts remain dynamic. The arbitrary
-recipient Private Send transaction measures 1078 bytes with this table; the
-older partial table `2LDxX9aeVaQhTjcDtwBqCGzA8Nm9MGGCShwnGSKzDYwy` measures
-1233 bytes and must not be used for this flow.
+The fresh Devnet release-gate fixture used a validated v0 lookup table with
+stable pool, shielded-state, mint, vault and token/system addresses; dynamic
+archive and recipient accounts remain outside the static table. On that real
+fixture, Private Send measured 1109 bytes and Unshield 1077 bytes. Both fit the
+1232-byte packet limit without extra transaction instructions. Applications
+must validate their own table configuration and preflight the complete signed
+transaction; different account lists can change packet size.
 
 Transactions are confirmed at finalized commitment. A confirmation response
 with a non-null `value.err` is a finalized failure. Timeouts and incomplete

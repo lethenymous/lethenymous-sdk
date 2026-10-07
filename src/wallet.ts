@@ -1,12 +1,12 @@
 import { ComputeBudgetProgram, PublicKey } from "@solana/web3.js";
 import { createAssociatedTokenAccountIdempotentInstruction, getAccount, getAssociatedTokenAddressSync, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { cryptoRandom, decryptNotePayload, encryptNote, encodeNote, keyHierarchy, noteCommitment, nullifier, ownerCommitment } from "./crypto.js";
-import { accountDiscriminator } from "./encoding.js";
 import { privateSwap as privateSwapIx, shield as shieldIx, unshield as unshieldIx } from "./instructions.js";
 import { encodePrivateSwapPublicInputs, encodeUnshieldPublicInputs } from "./prover.js";
 import { shieldFee, swapOutputPreservingLpClaims } from "./math.js";
 import { pda } from "./pda.js";
 import { OnChainPagedMerkleWitnessProvider } from "./archive.js";
+import { readCanonicalSpentStates } from "./spent.js";
 import type { JournaledNoteStore, MerkleWitnessProvider, Note, NoteStore, OperationRecord, Prover, ShieldParams } from "./types.js";
 import { transactionSignatureFromBytes, type Lethenymous } from "./client.js";
 
@@ -388,22 +388,8 @@ export class ShieldedWallet {
       if (!same(note.ownerCommitment, this.ownerCommitment)) continue;
       decoded.push({ event, mint, randomness: note.randomness, ownerCommitment: note.ownerCommitment, amount: note.amount, nullifier: nullifier(pool, mint, this.spendSecret, note.randomness) });
     }
-    const getMultipleAccountsInfo = this.sdk.connection.getMultipleAccountsInfo?.bind(this.sdk.connection);
-    if (decoded.length && !getMultipleAccountsInfo) throw new Error("RPC does not support finalized spent-nullifier verification");
-    const spentDiscriminator = accountDiscriminator("SpentNullifier");
-    for (let offset = 0; offset < decoded.length; offset += 100) {
-      const batch = decoded.slice(offset, offset + 100);
-      const addresses = batch.map(value => pda.spent(pool, value.nullifier, this.sdk.programId)[0]);
-      const accounts = await getMultipleAccountsInfo!(addresses, "finalized");
-      if (accounts.length !== batch.length) throw new Error("RPC returned an incomplete spent-nullifier response");
-      for (let index = 0; index < accounts.length; index++) {
-        const account = accounts[index];
-        if (!account) continue;
-        const data = account.data;
-        if (!account.owner.equals(this.sdk.programId) || data.length !== 73 || !data.subarray(0, 8).equals(spentDiscriminator) || !data.subarray(8, 40).equals(pool.toBuffer()) || !data.subarray(40, 72).equals(Buffer.from(batch[index].nullifier)) || data[72] !== 1) throw new Error("Invalid spent-nullifier account");
-        spentNullifiers.add(key(batch[index].nullifier));
-      }
-    }
+    const canonicalSpent = await readCanonicalSpentStates(this.sdk.connection, this.sdk.programId, pool, decoded.map(n => n.nullifier));
+    decoded.forEach((n, i) => { if (canonicalSpent[i]) spentNullifiers.add(key(n.nullifier)); });
     const recovered: Note[] = [];
     for (const candidate of decoded) {
       const { event, mint } = candidate;
@@ -435,8 +421,7 @@ export class ShieldedWallet {
       if (!input || !input.pool.equals(operation.pool) || !same(input.ownerCommitment,this.ownerCommitment) || !same(input.commitment,noteCommitment(input.pool,input.asset,input.amount,input.ownerCommitment,input.randomness))) throw new Error("Invalid retained spend input");
       const nf=nullifier(input.pool,input.asset,this.spendSecret,input.randomness);
       if (key(nf)!==operation.metadata.nullifier) throw new Error("Spend nullifier mismatch");
-      const accounts=await this.sdk.connection.getMultipleAccountsInfo([pda.spent(operation.pool,nf,this.sdk.programId)[0]],"finalized"),spent=accounts[0];
-      if (accounts.length!==1 || !spent || spent.executable || !spent.owner.equals(this.sdk.programId) || spent.data.length!==73 || !spent.data.subarray(0,8).equals(accountDiscriminator("SpentNullifier")) || !spent.data.subarray(8,40).equals(operation.pool.toBuffer()) || !spent.data.subarray(40,72).equals(Buffer.from(nf)) || spent.data[72]!==1) throw new Error("Canonical finalized spend is unavailable");
+      if (!(await readCanonicalSpentStates(this.sdk.connection,this.sdk.programId,operation.pool,[nf]))[0]) throw new Error("Canonical finalized spend is unavailable");
       const amountIn=BigInt(operation.metadata.amountIn),changeAmount=input.amount-amountIn;
       const output=outputs.at(-1)!;
       if (amountIn<=0n || changeAmount<0n || outputs.length!==(changeAmount>0n?2:1) || key(output.commitment)!==operation.metadata.outputCommitment || output.amount.toString()!==operation.metadata.amountOut || output.asset.toBase58()!==operation.metadata.assetOut || input.asset.toBase58()!==operation.metadata.assetIn) throw new Error("Swap output intent mismatch");
@@ -449,6 +434,37 @@ export class ShieldedWallet {
     for (const output of outputs) {const witness=await provider.getWitness(output.pool,output.commitment,generation);output.leafIndex=witness.index;}
     if (outputs.length===2 && outputs[1].leafIndex!==outputs[0].leafIndex!+1n) throw new Error("Swap outputs are not ordered contiguous leaves");
     return outputs;
+  }
+
+  private async publishRecoveredOperation(operation: OperationRecord, outputs: Note[]): Promise<void> {
+    // Membership proves issuance, not spendability. Check every output's OWN
+    // nullifier after membership/event location reads, as late as practical.
+    for (const note of outputs) {
+      if (!note.pool.equals(operation.pool) || !same(note.ownerCommitment, this.ownerCommitment) || !same(note.commitment, noteCommitment(note.pool, note.asset, note.amount, note.ownerCommitment, note.randomness))) throw new Error("Invalid recovered note preimage");
+    }
+    const existing = new Map((await this.getNotes()).map(n => [key(n.commitment), n]));
+    const spent = await readCanonicalSpentStates(this.sdk.connection, this.sdk.programId, operation.pool, outputs.map(n => nullifier(n.pool, n.asset, this.spendSecret, n.randomness)));
+    for (let i = 0; i < outputs.length; i++) {
+      const note = outputs[i], current = existing.get(key(note.commitment));
+      // Spent is monotonic, including after partial publication/restart. A stale
+      // absent response cannot downgrade a previously persisted consumed note.
+      const consumed = spent[i] || state(note) === "spent" || note.spent === true || current && (state(current) === "spent" || current.spent === true);
+      note.state = consumed ? "spent" : "available"; note.spent = !!consumed;
+    }
+    const journal = this.journal()!;
+    await journal.updateOperation(operation.id, { outputNotes: outputs });
+    if (operation.inputCommitment) await this.store.markSpent(operation.inputCommitment, operation.id);
+    for (const output of outputs) {
+      const current = (await this.getNotes()).find(n => same(n.commitment, output.commitment));
+      if (!current) { await this.store.saveNote(output); continue; }
+      if (!current.pool.equals(output.pool) || !current.asset.equals(output.asset) || current.amount !== output.amount || (current.generation ?? 0n) !== output.generation || current.leafIndex !== output.leafIndex || !same(current.ownerCommitment, output.ownerCommitment) || !same(current.randomness, output.randomness)) throw new Error("Conflicting recovered output");
+      if (output.spent && state(current) !== "spent") {
+        if (state(current) === "available") await this.store.reserveNote(current.commitment, cryptoRandom(32), this.ownerCommitment);
+        await this.store.markSpent(current.commitment);
+      }
+      // Existing spent/reserved/submitted records are never reset to available.
+    }
+    await journal.markOperationFinalized(operation.id);
   }
 
   async reconcilePending(): Promise<OperationRecord[]> {
@@ -470,14 +486,15 @@ export class ShieldedWallet {
         try { await journal.updateOperation(operation.id, { metadata: { signature } }); } catch { /* Keep the operation pending for the next reconciliation pass. */ }
       }
       if (operation.kind!=="unshield") {
-        try {
-          const outputs=await this.recoverAccountOutputs(operation);
-          await journal.updateOperation(operation.id,{outputNotes:outputs});
-          if (operation.inputCommitment) await this.store.markSpent(operation.inputCommitment,operation.id);
-          for (const note of outputs) await this.store.saveNote(note);
-          await journal.markOperationFinalized(operation.id);
+        let outputs: Note[] | undefined;
+        try { outputs=await this.recoverAccountOutputs(operation); }
+        catch { /* Optional history may locate issuance, but never prove unspent. */ }
+        if (outputs) {
+          try {
+            await this.publishRecoveredOperation(operation,outputs);
+          } catch { await journal.markOperationUnknown(operation.id,"Recovered output spent state or publication is unavailable"); }
           continue;
-        } catch { /* An optional transaction fast path may still supply evidence. */ }
+        }
       }
       let outcome;
       try {outcome = await this.sdk.reconcileTransaction(signature, operation.lastValidBlockHeight === undefined ? undefined : Number(operation.lastValidBlockHeight));}
@@ -487,8 +504,9 @@ export class ShieldedWallet {
         const needles = Object.values(operation.metadata).filter(value => /^[0-9a-f]{64}$/i.test(value)).map(value => Uint8Array.from(Buffer.from(value, "hex")));
         if (!(await this.sdk.hasFinalizedProgramEvent(signature, eventName, needles))) { await journal.markOperationUnknown(operation.id, "Finalized transaction has no authenticated matching event"); continue; }
         if (operation.kind !== "unshield") {
-          try { await this.locateOutputs(operation.kind, operation.pool, signature, operation.outputNotes, operation.metadata.nullifier); await journal.updateOperation(operation.id, { outputNotes: operation.outputNotes }); }
-          catch { await journal.markOperationUnknown(operation.id, "Authenticated finalized note locations are unavailable"); continue; }
+          try { await this.locateOutputs(operation.kind, operation.pool, signature, operation.outputNotes, operation.metadata.nullifier); await this.publishRecoveredOperation(operation,operation.outputNotes); }
+          catch { await journal.markOperationUnknown(operation.id, "Authenticated finalized note locations/spent state are unavailable"); }
+          continue;
         }
         if (operation.inputCommitment) await this.store.markSpent(operation.inputCommitment, operation.id);
         for (const note of operation.outputNotes) await this.store.saveNote(note);

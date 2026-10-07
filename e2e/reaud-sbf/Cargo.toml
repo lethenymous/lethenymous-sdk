@@ -1,0 +1,33 @@
+[package]
+name = "lethenymous-reaud-sbf"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[test]]
+name = "spent_output"
+path = "spent_output.rs"
+
+[dev-dependencies]
+anchor-lang = "=0.32.1"
+anchor-spl = "=0.32.1"
+solana-program-test = "2.3.13"
+solana-sdk = "2.3.1"
+solana-program = "2.3.0"
+solana-sha256-hasher = "2.3.0"
+spl-token = "8.0.0"
+spl-token-2022 = "8.0.1"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+zkcpmm = { path = "../../../zkCPMM/programs/zkcpmm" }
+zkcpmm-zk = { path = "../../../zkCPMM/zkcpmm-zk", features = ["unsafe-test-keys"] }
+shielded-core = { path = "../../../zkCPMM/shielded-core" }
+getrandom = "0.3"
+bincode = "1.3"
+serde_json = "1.0"
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1

@@ -72,5 +72,6 @@ export declare class ShieldedWallet {
     private localNote;
     recoverShieldedNotes(pool: PublicKey): Promise<Note[]>;
     private recoverAccountOutputs;
+    private publishRecoveredOperation;
     reconcilePending(): Promise<OperationRecord[]>;
 }

@@ -1,5 +1,10 @@
 # Paged Merkle audit remediation — SDK
 
+The subsequent SDK-only REAUD-01 correction is documented in
+[REAUD_SPENT_OUTPUT_RECOVERY.md](REAUD_SPENT_OUTPUT_RECOVERY.md). Pending recovery
+now checks each output's own current spent state; archive membership alone does
+not establish spendability. The results below record the earlier remediation.
+
 Branch: `fix/paged-merkle-audit-remediation`. Clean starting SDK HEAD:
 `f252be93b951365faa8f7d4d13c017e859ea3b54`.
 Paired core starts at `8d58a1a1423402146d3d37a7cea3797978dd33a6`.

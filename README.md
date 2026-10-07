@@ -2,6 +2,13 @@
 
 ## Feature-branch generation update
 
+The SDK-only REAUD-01 fix validates every recovered output's own canonical
+finalized spent state before publication. Consumed notes stay consumed across
+restarts and never enter spendable balance. See
+[REAUD_SPENT_OUTPUT_RECOVERY.md](REAUD_SPENT_OUTPUT_RECOVERY.md) for mixed-state,
+restart, strict-account and genuine SBF reproduction evidence. Pending focused
+independent re-test.
+
 The defensive-audit remediation is documented in
 [PAGED_MERKLE_AUDIT_REMEDIATION.md](PAGED_MERKLE_AUDIT_REMEDIATION.md): account-only
 pending-output reconciliation, directory-v2 parsing and priority-fee packet

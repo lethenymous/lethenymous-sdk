@@ -19,6 +19,7 @@
     "CHECKPOINT_SCALABILITY.md",
     "ONCHAIN_MERKLE_ARCHIVE.md",
     "PAGED_MERKLE_AUDIT_REMEDIATION.md",
+    "REAUD_SPENT_OUTPUT_RECOVERY.md",
     "LICENSE"
   ],
   "main": "./dist/index.js",
@@ -39,6 +40,7 @@
     "test": "node --test tests/*.test.mjs",
     "test:stress": "npm run build && node --test tests/stress/witness-capacity.mjs",
     "test:e2e": "npm run build && node e2e/run.mjs",
+    "test:reaud:sbf": "cargo test --manifest-path e2e/reaud-sbf/Cargo.toml --target-dir e2e/reaud-sbf/target --release --locked --test spent_output reaud_issued_then_consumed_outputs_restore_as_spent -- --nocapture",
     "pack:check": "npm pack --dry-run"
   },
   "dependencies": {

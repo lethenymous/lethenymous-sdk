@@ -444,7 +444,7 @@ test("shield recovery verifies finalized spent-nullifier account data", async ()
   const sdk = {
     programId,
     connection: {
-      getMultipleAccountsInfo: async addresses => addresses.map(() => ({ owner: programId, data: spentAccount })),
+      getMultipleAccountsInfo: async addresses => addresses.map(() => ({ owner: programId, executable: false, data: spentAccount })),
     },
     getShieldedState: async () => ({ tokenAMint: asset, tokenBMint: new PublicKey(Uint8Array.from({ length: 32 }, (_, index) => index + 160)) }),
   };

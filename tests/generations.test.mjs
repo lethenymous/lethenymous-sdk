@@ -135,6 +135,7 @@ test("encrypted pending swap recovers exact finalized generation and page-bounda
     f.sdk.getFinalizedShieldedEvents=async()=>[event,event];
     assert.equal((await returning.reconcilePending()).length,1);assert.equal((await reopened.getNotes()).length,1);
     f.sdk.getFinalizedShieldedEvents=async()=>[event];
+    f.sdk.connection.getMultipleAccountsInfo=async addresses=>addresses.map(()=>null);
     assert.equal((await returning.reconcilePending()).length,0);
     const fresh=EncryptedFileNoteStore.fromSeed(path,f.seed,f.note.ownerCommitment),notes=await fresh.getNotes();
     assert.equal(notes.length,3);assert(notes.find(n=>n.amount===10000n).spent);

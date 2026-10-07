@@ -20,3 +20,4 @@ node_modules/
 .idea/
 notes.lnsj
 notes.lnsj.lock
+/e2e/reaud-sbf/target/
